@@ -1,12 +1,6 @@
-use crate::config;
-use crate::raft::{LogEntry, ServerId, Storage, Term};
+use crate::raft::*;
 use std::error;
 use std::fmt;
-
-pub fn new(cfg: &config::RaftConfig) -> Box<dyn Storage<E = Error>> {
-    let s = InMemoryStorage::new();
-    Box::new(s)
-}
 
 #[derive(Debug)]
 pub enum Error {}
@@ -29,17 +23,17 @@ impl error::Error for Error {
 type Result<T> = std::result::Result<T, Error>;
 
 pub struct InMemoryStorage {
-    currentTerm: Term,
-    votedFor: Option<ServerId>,
-    logEntries: Vec<LogEntry>,
+    current_term: Term,
+    voted_for: Option<ServerId>,
+    log_entries: Vec<LogEntry>,
 }
 
 impl InMemoryStorage {
-    fn new() -> InMemoryStorage {
+    pub fn new() -> InMemoryStorage {
         InMemoryStorage {
-            currentTerm: 0,
-            votedFor: None,
-            logEntries: Vec::new(),
+            current_term: 0,
+            voted_for: None,
+            log_entries: Vec::new(),
         }
     }
 }
@@ -47,26 +41,44 @@ impl InMemoryStorage {
 impl Storage for InMemoryStorage {
     type E = Error;
     fn current_term(&self) -> Result<Term> {
-        Ok(self.currentTerm)
+        Ok(self.current_term)
     }
     fn set_current_term(&mut self, t: Term) -> Result<()> {
-        self.currentTerm = t;
+        self.current_term = t;
         Ok(())
     }
 
     fn voted_for(&self) -> Result<Option<ServerId>> {
-        Ok(self.votedFor.clone())
+        Ok(self.voted_for.clone())
     }
     fn set_voted_for(&mut self, candidate: Option<ServerId>) -> Result<()> {
-        self.votedFor = candidate;
+        self.voted_for = candidate;
         Ok(())
     }
 
-    fn logs(&self) -> Result<std::slice::Iter<LogEntry>> {
-        Ok(self.logEntries.iter())
+    fn contains(&self, term: Term, index: LogIndex) -> Result<bool> {
+        Ok(self.log_entries
+            .iter()
+            .any(|x| x.index == index && x.term == term))
     }
-    fn apppend(&mut self, logs: Vec<LogEntry>) -> Result<()> {
-        self.logEntries.extend(logs);
+    fn append(&mut self, mut logs: Vec<LogEntry>) -> Result<()> {
+        // If an existing entry conflicts with a new one (same index but different terms),
+        // delete the existing entry and all that follow it.
+        if let Some(min_conflict) = logs
+            .iter()
+            .filter(|x| {
+                self.log_entries
+                    .iter()
+                    .any(|y| y.index == x.index && y.term != x.term)
+            })
+            .min()
+        {
+            self.log_entries.retain(|x| x.index < min_conflict.index);
+        }
+        // Append any new entries not already in the log
+        self.log_entries.append(&mut logs);
+        self.log_entries.sort();
+        self.log_entries.dedup();
         Ok(())
     }
 }
