@@ -1,11 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
-use std::error;
-use std::result;
-use std::slice;
+use std::net::SocketAddr;
 
 pub type Term = u32;
-pub type ServerId = String;
+pub type ServerId = SocketAddr;
 pub type LogCommand = String;
 pub type LogIndex = usize;
 
@@ -16,17 +14,33 @@ pub struct LogEntry {
     pub command: LogCommand,
 }
 
-pub trait Storage {
-    type E: error::Error;
+#[derive(Serialize, Deserialize, Debug)]
+pub struct AppendEntriesRequest {
+    pub term: Term,
+    pub leader_id: ServerId,
+    pub prev_log_index: LogIndex,
+    pub entries: Vec<LogEntry>,
+    pub leader_commit: LogIndex,
+}
 
-    fn current_term(&self) -> result::Result<Term, Self::E>;
-    fn set_current_term(&mut self, t: Term) -> result::Result<(), Self::E>;
+#[derive(Serialize, Deserialize, Debug)]
+pub struct AppendEntriesResponse {
+    pub term: Term,
+    pub success: bool,
+}
 
-    fn voted_for(&self) -> result::Result<Option<ServerId>, Self::E>;
-    fn set_voted_for(&mut self, candidate: Option<ServerId>) -> result::Result<(), Self::E>;
+#[derive(Serialize, Deserialize, Debug)]
+pub struct RequestVoteRequest {
+    pub term: Term,
+    pub candidate_id: ServerId,
+    pub last_log_index: LogIndex,
+    pub last_log_term: Term,
+}
 
-    fn contains(&self, term: Term, index: LogIndex) -> result::Result<bool, Self::E>;
-    fn append(&mut self, logs: Vec<LogEntry>) -> result::Result<(), Self::E>;
+#[derive(Serialize, Deserialize, Debug)]
+pub struct RequestVoteResponse {
+    pub term: Term,
+    pub vote_granted: bool,
 }
 
 impl Ord for LogEntry {

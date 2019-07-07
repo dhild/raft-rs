@@ -1,169 +1,150 @@
-use serde::{Deserialize, Serialize};
+use futures::prelude::*;
 use std::error;
-use std::result;
-use std::slice;
+use std::result::Result;
+use std::time::Instant;
 
-mod logs;
-pub use logs::*;
+mod types;
+pub use types::*;
 
-pub enum Server<E> {
-    Follower(Raft<Follower, E>),
-    Candidate(Raft<Candidate, E>),
-    Leader(Raft<Leader, E>),
+pub trait Storage {
+    type E: error::Error;
+
+    fn current_term(&self) -> Result<Term, Self::E>;
+    fn set_current_term(&mut self, t: Term) -> Result<(), Self::E>;
+
+    fn voted_for(&self) -> Result<Option<ServerId>, Self::E>;
+    fn set_voted_for(&mut self, candidate: Option<ServerId>) -> Result<(), Self::E>;
+
+    fn contains(&self, term: Term, index: LogIndex) -> Result<bool, Self::E>;
+    fn append(&mut self, logs: Vec<LogEntry>) -> Result<(), Self::E>;
 }
 
-impl<E: error::Error> Server<E> {
-    pub fn new(storage: Box<dyn Storage<E = E>>) -> Self {
-        Server::Follower(Raft::<Follower, E>::new(storage))
-    }
+pub trait RPC {
+    type E: error::Error;
 
-    pub fn run(self) {}
+    fn append_entries(
+        &mut self,
+        server: &ServerId,
+        req: AppendEntriesRequest,
+    ) -> Box<dyn Future<Item = AppendEntriesResponse, Error = Self::E>>;
+
+    fn request_vote(
+        &mut self,
+        server: &ServerId,
+        req: RequestVoteRequest,
+    ) -> Box<dyn Future<Item = RequestVoteResponse, Error = Self::E>>;
 }
 
-pub struct Raft<S, E> {
-    state: S,
-    storage: Box<dyn Storage<E = E>>,
+pub struct Raft<E> {
+    id: ServerId,
+    state: RaftState,
+    storage: Box<dyn Storage<E = E> + Send>,
     commit_index: LogIndex,
     last_applied: LogIndex,
 }
 
-pub struct Leader {
+enum RaftState {
+    Follower(Follower),
+    Candidate(Candidate),
+    Leader(Leader),
+}
+
+struct Follower {
+    last_leader_contact: Instant,
+}
+
+impl Follower {
+    fn new() -> Follower {
+        Follower {
+            last_leader_contact: Instant::now(),
+        }
+    }
+
+    fn leader_updated(&mut self) {
+        self.last_leader_contact = Instant::now();
+    }
+}
+
+impl From<&mut Candidate> for Follower {
+    fn from(_c: &mut Candidate) -> Self {
+        Follower::new()
+    }
+}
+
+impl From<&mut Leader> for Follower {
+    fn from(_l: &mut Leader) -> Self {
+        Follower::new()
+    }
+}
+
+struct Candidate {
+    election_started: Instant,
+}
+struct Leader {
     next_index: Vec<(ServerId, LogIndex)>,
     match_index: Vec<(ServerId, LogIndex)>,
 }
-pub struct Candidate {}
-pub struct Follower {}
 
-impl<E: error::Error> Raft<Follower, E> {
-    fn new(storage: Box<dyn Storage<E = E>>) -> Self {
+impl<E: error::Error> Raft<E> {
+    pub fn new(id: ServerId, storage: Box<dyn Storage<E = E> + Send>) -> Self {
         Raft {
-            state: Follower {},
+            id: id,
+            state: RaftState::Follower(Follower::new()),
             storage: storage,
             commit_index: 0,
             last_applied: 0,
         }
     }
-}
 
-impl<E: error::Error> From<Raft<Follower, E>> for Raft<Candidate, E> {
-    fn from(val: Raft<Follower, E>) -> Raft<Candidate, E> {
-        Raft {
-            state: Candidate {},
-            storage: val.storage,
-            commit_index: val.commit_index,
-            last_applied: val.last_applied,
-        }
-    }
-}
-
-impl<E: error::Error> From<Raft<Candidate, E>> for Raft<Follower, E> {
-    fn from(val: Raft<Candidate, E>) -> Raft<Follower, E> {
-        Raft {
-            state: Follower {},
-            storage: val.storage,
-            commit_index: val.commit_index,
-            last_applied: val.last_applied,
-        }
-    }
-}
-
-impl<E: error::Error> From<(Raft<Candidate, E>, LogIndex, Term, &[ServerId])> for Raft<Leader, E> {
-    fn from(val: (Raft<Candidate, E>, LogIndex, Term, &[ServerId])) -> Raft<Leader, E> {
-        let (val, last_log, term, servers) = val;
-        Raft {
-            state: Leader {
-                next_index: servers
-                    .iter()
-                    .map(|x| (x.clone(), last_log + (1 as usize)))
-                    .collect(),
-                match_index: servers.iter().map(|x| (x.clone(), 0 as usize)).collect(),
-            },
-            storage: val.storage,
-            commit_index: val.commit_index,
-            last_applied: val.last_applied,
-        }
-    }
-}
-
-impl<E: error::Error> From<Raft<Leader, E>> for Raft<Follower, E> {
-    fn from(val: Raft<Leader, E>) -> Raft<Follower, E> {
-        Raft {
-            state: Follower {},
-            storage: val.storage,
-            commit_index: val.commit_index,
-            last_applied: val.last_applied,
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct AppendEntriesRequest {
-    term: Term,
-    leader_id: ServerId,
-    prev_log_index: LogIndex,
-    entries: Vec<LogEntry>,
-    leader_commit: LogIndex,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct AppendEntriesResponse {
-    term: Term,
-    success: bool,
-}
-
-impl<E: error::Error> Raft<Follower, E> {
-    fn append_entries(
-        mut self,
-        req: AppendEntriesRequest,
-    ) -> (Self, Result<AppendEntriesResponse, E>) {
-        let res = self.append_entries_mut(req);
-        (
-            Raft {
-                state: Follower {},
-                storage: self.storage,
-                commit_index: self.commit_index,
-                last_applied: self.last_applied,
-            },
-            res,
-        )
+    pub fn update<RE, R>(&mut self, rpc: &mut R)
+    where
+        RE: error::Error,
+        R: RPC<E = RE>,
+    {
+        info!("not implemented yet")
     }
 
-    fn append_entries_mut(
+    pub fn append_entries(
         &mut self,
         req: AppendEntriesRequest,
     ) -> Result<AppendEntriesResponse, E> {
-        let term = self.storage.current_term()?;
-        if req.term < term {
+        let current_term = self.storage.current_term()?;
+        if req.term < current_term {
             return Ok(AppendEntriesResponse {
-                term: term,
+                term: current_term,
                 success: false,
             });
         }
+        match &mut self.state {
+            RaftState::Follower(f) => {
+                trace!(target: "raft_state", "Follower received heartbeat message");
+                f.leader_updated();
+            }
+            RaftState::Candidate(c) => {
+                debug!(target: "raft_state", "Candidate received message from leader; converting to follower");
+                self.state = RaftState::Follower(c.into());
+            }
+            RaftState::Leader(l) => {
+                debug!(target: "raft_state", "Leader received message from newer leader; converting to follower");
+                self.state = RaftState::Follower(l.into());
+            }
+        }
+
         if req.prev_log_index > 0 && !self.storage.contains(req.term, req.prev_log_index)? {
             return Ok(AppendEntriesResponse {
-                term: term,
+                term: current_term,
                 success: false,
             });
         }
         Ok(AppendEntriesResponse {
-            term: term,
+            term: current_term,
             success: true,
         })
     }
-}
 
-#[derive(Serialize, Deserialize, Debug)]
-pub struct RequestVoteRequest {
-    term: Term,
-    candidate_id: ServerId,
-    last_log_index: LogIndex,
-    last_log_term: Term,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct RequestVoteResponse {
-    term: Term,
-    vote_granted: bool,
+    pub fn request_vote(&mut self, req: RequestVoteRequest) -> Result<RequestVoteResponse, E> {
+        panic!("not implemented yet")
+    }
 }
 
 #[cfg(test)]
@@ -171,10 +152,10 @@ mod tests {
     use super::*;
     use crate::storage::*;
 
-    fn follower(term: Term, commit_index: LogIndex) -> Raft<Follower, Error> {
+    fn follower(term: Term, commit_index: LogIndex) -> Raft<Error> {
         let mut s = InMemoryStorage::new();
-        s.set_current_term(term);
-        let mut r = Raft::<Follower, Error>::new(Box::new(s));
+        s.set_current_term(term).unwrap();
+        let mut r = Raft::new(([127, 0, 0, 1], 8080).into(), Box::new(s));
         r.commit_index = commit_index;
         r
     }
@@ -182,57 +163,62 @@ mod tests {
     fn heartbeat(
         term: Term,
         prev_log_index: LogIndex,
-        commit_index: LogIndex,
+        leader_commit: LogIndex,
     ) -> AppendEntriesRequest {
         AppendEntriesRequest {
             term: term,
-            leader_id: "leader".to_string(),
+            leader_id: ([127, 0, 0, 1], 8080).into(),
             prev_log_index: prev_log_index,
             entries: Vec::new(),
-            leader_commit: commit_index,
+            leader_commit: leader_commit,
         }
     }
 
     #[test]
     fn test_follower_append_entries_heartbeat() {
         // Term is earlier, should fail
-        let f = follower(3, 0);
-        let (f, resp) = f.append_entries(heartbeat(2, 0, 0));
+        let mut f = follower(3, 0);
+        let resp = f.append_entries(heartbeat(2, 0, 0));
         assert!(
             !resp.unwrap().success,
             "Reply should be false if term < current_term"
         );
+        assert_eq!(0, f.commit_index, "Commit index should be unchanged");
 
         // Term is the same, should fail when index is too new
-        let f = follower(3, 0);
-        let (f, resp) = f.append_entries(heartbeat(3, 1, 0));
+        let mut f = follower(3, 0);
+        let resp = f.append_entries(heartbeat(3, 1, 0));
         assert!(
             !resp.unwrap().success,
             "Reply should be false when entries are missing"
         );
+        assert_eq!(0, f.commit_index, "Commit index should be unchanged");
 
         // Term is the same, should succeed when index matches
-        let f = follower(3, 0);
-        let (f, resp) = f.append_entries(heartbeat(3, 0, 0));
+        let mut f = follower(3, 0);
+        let resp = f.append_entries(heartbeat(3, 0, 0));
         assert!(
             resp.unwrap().success,
             "Reply should be true if term = current_term"
         );
+        assert_eq!(0, f.commit_index, "Commit index should be unchanged");
 
         // Term is newer, should fail when index is too new
-        let f = follower(3, 0);
-        let (f, resp) = f.append_entries(heartbeat(4, 1, 0));
+        let mut f = follower(3, 0);
+        let resp = f.append_entries(heartbeat(4, 1, 0));
         assert!(
             !resp.unwrap().success,
             "Reply should be false when entries are missing"
         );
+        assert_eq!(0, f.commit_index, "Commit index should be unchanged");
 
         // Term is newer, should succeed when index matches
-        let f = follower(3, 0);
-        let (f, resp) = f.append_entries(heartbeat(4, 0, 0));
+        let mut f = follower(3, 0);
+        let resp = f.append_entries(heartbeat(4, 0, 0));
         assert!(
             resp.unwrap().success,
             "Reply should be true if term > current_term"
         );
+        assert_eq!(0, f.commit_index, "Commit index should be unchanged");
     }
 }
