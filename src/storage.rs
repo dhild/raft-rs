@@ -57,7 +57,8 @@ impl Storage for InMemoryStorage {
     }
 
     fn contains(&self, term: Term, index: LogIndex) -> Result<bool> {
-        Ok(self.log_entries
+        Ok(self
+            .log_entries
             .iter()
             .any(|x| x.index == index && x.term == term))
     }
@@ -80,5 +81,30 @@ impl Storage for InMemoryStorage {
         self.log_entries.sort();
         self.log_entries.dedup();
         Ok(())
+    }
+
+    fn last_log_entry(&self) -> Result<Option<(LogIndex, Term)>> {
+        Ok(self
+            .log_entries
+            .iter()
+            .max()
+            .map(|last| (last.index, last.term)))
+    }
+
+    fn get_entries_from(&self, index: LogIndex) -> Result<Vec<LogEntry>> {
+        Ok(self
+            .log_entries
+            .iter()
+            .filter(|entry| entry.index >= index)
+            .map(|entry| entry.clone())
+            .collect())
+    }
+
+    fn get_term(&self, index: LogIndex) -> Result<Option<Term>> {
+        Ok(self
+            .log_entries
+            .iter()
+            .find(|entry| entry.index == index)
+            .map(|entry| entry.term))
     }
 }

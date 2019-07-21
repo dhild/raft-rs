@@ -1,3 +1,4 @@
+use futures::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::net::SocketAddr;
@@ -7,14 +8,14 @@ pub type ServerId = SocketAddr;
 pub type LogCommand = String;
 pub type LogIndex = usize;
 
-#[derive(Serialize, Deserialize, Debug, Eq)]
+#[derive(Serialize, Deserialize, Debug, Eq, Clone)]
 pub struct LogEntry {
     pub term: Term,
     pub index: LogIndex,
     pub command: LogCommand,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct AppendEntriesRequest {
     pub term: Term,
     pub leader_id: ServerId,
@@ -23,13 +24,16 @@ pub struct AppendEntriesRequest {
     pub leader_commit: LogIndex,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct AppendEntriesResponse {
     pub term: Term,
     pub success: bool,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+pub type FutureAppendEntriesResponse =
+    Box<dyn Send + Future<Item = (AppendEntriesRequest, AppendEntriesResponse), Error = ()>>;
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct RequestVoteRequest {
     pub term: Term,
     pub candidate_id: ServerId,
@@ -37,11 +41,14 @@ pub struct RequestVoteRequest {
     pub last_log_term: Term,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct RequestVoteResponse {
     pub term: Term,
     pub vote_granted: bool,
 }
+
+pub type FutureRequestVoteResponse =
+    Box<dyn Send + Future<Item = (RequestVoteRequest, RequestVoteResponse), Error = ()>>;
 
 impl Ord for LogEntry {
     fn cmp(&self, other: &Self) -> Ordering {

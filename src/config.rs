@@ -16,7 +16,7 @@ impl RaftConfig {
 
     pub fn build_raft(&self) -> Arc<Mutex<Raft<storage::Error>>> {
         let addr = ([127, 0, 0, 1], 8080).into();
-        let raft = Raft::new(addr, self.build_storage());
+        let raft = Raft::new(addr, self.build_storage(), vec![addr]);
         Arc::new(Mutex::new(raft))
     }
 
