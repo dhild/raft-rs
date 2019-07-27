@@ -69,3 +69,13 @@ impl PartialEq for LogEntry {
         self.index == other.index && self.term == other.term
     }
 }
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Status {
+    pub leader: Option<ServerId>,
+    pub peers: Vec<ServerId>,
+    pub last_log_term: Option<Term>,
+    pub last_log_index: Option<LogIndex>,
+    pub commit_index: LogIndex,
+    pub last_applied: LogIndex,
+}

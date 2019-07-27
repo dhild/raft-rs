@@ -5,7 +5,7 @@ use std::fmt;
 use std::result::Result;
 use std::time::{Duration, Instant};
 
-mod types;
+pub mod types;
 pub use types::*;
 
 pub trait Storage {
@@ -32,11 +32,8 @@ pub trait RPC {
         req: AppendEntriesRequest,
     ) -> FutureAppendEntriesResponse;
 
-    fn request_vote(
-        &mut self,
-        to: &ServerId,
-        req: RequestVoteRequest,
-    ) -> FutureRequestVoteResponse;
+    fn request_vote(&mut self, to: &ServerId, req: RequestVoteRequest)
+        -> FutureRequestVoteResponse;
 }
 
 pub struct Raft<E> {
@@ -134,9 +131,10 @@ struct Candidate {
 impl Candidate {
     fn new(election_timeout: Duration, votes: Vec<FutureRequestVoteResponse>) -> Candidate {
         let required = 1 + (votes.len() / 2);
-        let results = votes
-            .into_iter()
-            .map(|f| f.map(|(_, x)| x.vote_granted).or_else(|_| ok::<bool, ()>(false)));
+        let results = votes.into_iter().map(|f| {
+            f.map(|(_, x)| x.vote_granted)
+                .or_else(|_| ok::<bool, ()>(false))
+        });
         let result = join_all(results).and_then(move |v| {
             let votes = v.iter().filter(|x| **x).count();
             ok::<bool, ()>(votes >= required)
@@ -487,6 +485,20 @@ impl<E: error::Error> Raft<E> {
             term: current_term,
             vote_granted: false,
         })
+    }
+
+    pub fn status(&self) -> Result<Status, E> {
+        let last_entry = self.storage.last_log_entry()?;
+        let status = Status {
+            leader: self.storage.voted_for()?,
+            peers: self.known_peers.clone(),
+            last_log_term: last_entry.map(|x| x.1),
+            last_log_index: last_entry.map(|x| x.0),
+            commit_index: self.commit_index,
+            last_applied: self.last_applied,
+        };
+        debug!("Responding to status with {:?}", status);
+        Ok(status)
     }
 }
 

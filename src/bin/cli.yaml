@@ -1,0 +1,15 @@
+name: raft
+args:
+- verbose:
+    short: v
+    multiple: true
+    help: Output more detailed information
+subcommands:
+- serve:
+    about: Starts a raft server
+    args:
+    - address:
+        help: The server address to listen on
+    - peer:
+        help: The addresses of peers to connect with
+        multiple: true
