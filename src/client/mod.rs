@@ -44,20 +44,22 @@ impl error::Error for Error {
 pub fn health<S: Into<SocketAddr>>(addr: S) -> ClientFuture<HealthStatus> {
     let addr = addr.into();
 
-    Client::new().health(&addr)
+    Client::default().health(&addr)
 }
 
 pub struct Client {
     client: client::Client<client::HttpConnector, Body>,
 }
 
-impl Client {
-    pub fn new() -> Client {
-        Client {
+impl Default for Client {
+    fn default() -> Self {
+        Self {
             client: client::Client::new(),
         }
     }
+}
 
+impl Client {
     fn health(&mut self, id: &ServerId) -> ClientFuture<HealthStatus> {
         let uri: hyper::Uri = format!("http://{}/status", id).parse().unwrap();
         trace!("Sending GET to {}", uri);
@@ -70,10 +72,10 @@ impl Client {
                 Error::REST(e)
             })
             .and_then(|resp| {
-                return resp.into_body().concat2().map_err(|e| {
+                resp.into_body().concat2().map_err(|e| {
                     error!("Failed to read full health response: {}", e);
                     Error::REST(e)
-                });
+                })
             })
             .and_then(move |chunk| match serde_json::from_slice(&chunk) {
                 Ok(status) => Ok(HealthStatus {
@@ -117,18 +119,15 @@ impl RPC for Client {
             .request(request)
             .map_err(|e| {
                 error!("Failed to get append_entries response: {}", e);
-                ()
             })
             .and_then(|resp| {
-                return resp.into_body().concat2().map_err(|e| {
+                resp.into_body().concat2().map_err(|e| {
                     error!("Failed to read full append_entries response: {}", e);
-                    ()
-                });
+                })
             })
             .and_then(move |chunk| {
                 serde_json::from_slice(&chunk).map_err(|e| {
                     error!("Failed to unmarshal append_entries response: {}", e);
-                    ()
                 })
             })
             .map(|resp| (req, resp));
@@ -163,18 +162,15 @@ impl RPC for Client {
             .request(request)
             .map_err(|e| {
                 error!("Failed to get request_vote response: {}", e);
-                ()
             })
             .and_then(|resp| {
-                return resp.into_body().concat2().map_err(|e| {
+                resp.into_body().concat2().map_err(|e| {
                     error!("Failed to read full request_vote response: {}", e);
-                    ()
-                });
+                })
             })
             .and_then(move |chunk| {
                 serde_json::from_slice(&chunk).map_err(|e| {
                     error!("Failed to unmarshal request_vote response: {}", e);
-                    ()
                 })
             })
             .map(|resp| (req, resp));

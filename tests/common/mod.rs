@@ -4,9 +4,9 @@ use raft_rs::*;
 use std::net::SocketAddr;
 
 pub fn three_servers() -> (SocketAddr, SocketAddr, SocketAddr, ServerFuture, Sender<()>) {
-    let addr1 = ([0, 0, 0, 0], 8080).into();
-    let addr2 = ([0, 0, 0, 0], 8081).into();
-    let addr3 = ([0, 0, 0, 0], 8082).into();
+    let addr1 = ([127, 0, 0, 1], 8080).into();
+    let addr2 = ([127, 0, 0, 1], 8081).into();
+    let addr3 = ([127, 0, 0, 1], 8082).into();
     let (stop1, rx1) = channel();
     let (stop2, rx2) = channel();
     let (stop3, rx3) = channel();
@@ -41,13 +41,7 @@ pub fn three_servers() -> (SocketAddr, SocketAddr, SocketAddr, ServerFuture, Sen
         })
         .join4(server1, server2, server3)
         .and_then(|_| ok(()));
-    (
-        ([127, 0, 0, 1], addr1.port()).into(),
-        ([127, 0, 0, 1], addr2.port()).into(),
-        ([127, 0, 0, 1], addr3.port()).into(),
-        Box::new(servers),
-        stop,
-    )
+    (addr1, addr2, addr3, Box::new(servers), stop)
 }
 
 pub fn run_server_test<E, F>(server: ServerFuture, stop: Sender<()>, test: F)

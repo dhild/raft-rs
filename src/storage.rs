@@ -49,7 +49,7 @@ impl Storage for InMemoryStorage {
     }
 
     fn voted_for(&self) -> Result<Option<ServerId>> {
-        Ok(self.voted_for.clone())
+        Ok(self.voted_for)
     }
     fn set_voted_for(&mut self, candidate: Option<ServerId>) -> Result<()> {
         self.voted_for = candidate;
@@ -96,7 +96,7 @@ impl Storage for InMemoryStorage {
             .log_entries
             .iter()
             .filter(|entry| entry.index >= index)
-            .map(|entry| entry.clone())
+            .cloned()
             .collect())
     }
 

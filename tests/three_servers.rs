@@ -2,6 +2,7 @@ extern crate env_logger;
 #[macro_use]
 extern crate log;
 extern crate hyper;
+extern crate tokio_timer;
 
 mod common;
 
@@ -13,7 +14,7 @@ use std::time::{Duration, Instant};
 #[test]
 fn three_servers_leader_matches() {
     env_logger::builder()
-        .filter(Some("raft_rs"), log::LevelFilter::Info)
+        .filter(Some("raft_rs"), log::LevelFilter::Debug)
         .init();
     let (addr1, addr2, addr3, server, stop) = common::three_servers();
 
@@ -44,11 +45,14 @@ fn three_servers_leader_matches() {
                             warn!("Leaders do not match: {:?}, {:?}, {:?}", l1, l2, l3);
                         }
                     };
-                    if start.elapsed() > Duration::from_secs(5) {
+                    if start.elapsed() > Duration::from_millis(500) {
                         return Err("Timeout reached without quorum");
                     }
 
                     Ok(Loop::Continue((addr1, addr2, addr3, start)))
+                })
+                .then(|x| {
+                    tokio_timer::Delay::new(Instant::now() + Duration::from_millis(25)).then(|_| x)
                 })
         },
     );

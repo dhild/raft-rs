@@ -79,7 +79,7 @@ where
 fn update_loop<E: error::Error + 'static>(
     raft: Arc<Mutex<Raft<E>>>,
 ) -> Box<dyn Future<Item = (), Error = Error> + Send> {
-    let rpc = client::Client::new();
+    let rpc = client::Client::default();
     let fut = loop_fn((raft, rpc), |(arc, mut rpc)| {
         match arc.lock() {
             Ok(mut raft) => raft.update(&mut rpc),
@@ -89,7 +89,6 @@ fn update_loop<E: error::Error + 'static>(
         Delay::new(Instant::now() + Duration::from_millis(50))
             .map_err(|e| {
                 error!("Failed to execute delay: {}", e);
-                ()
             })
             .then(|res| match res {
                 Ok(_) => ok(Loop::Continue((arc, rpc))),
@@ -108,10 +107,7 @@ type ResponseFut = Box<dyn Future<Item = Response<Body>, Error = hyper::Error> +
 
 impl<E: error::Error + 'static> Server<E> {
     pub fn new(addr: SocketAddr, raft: Arc<Mutex<Raft<E>>>) -> Server<E> {
-        Server {
-            addr: addr,
-            raft: raft,
-        }
+        Server { addr, raft }
     }
 
     fn raft_mut_post<X, Y, F>(
@@ -210,7 +206,7 @@ impl<E: error::Error + 'static> Server<E> {
                 service_fn(move |req: Request<Body>| -> ResponseFut { Self::route(&raft, req) })
             })
             .with_graceful_shutdown(stop)
-            .map_err(|e| Error::Server(e));
+            .map_err(Error::Server);
 
         Box::new(server)
     }

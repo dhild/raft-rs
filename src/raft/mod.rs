@@ -141,7 +141,7 @@ impl Candidate {
         });
         Candidate {
             election_started: Instant::now(),
-            election_timeout: election_timeout,
+            election_timeout,
             result: None,
             future: Box::new(result),
         }
@@ -154,7 +154,7 @@ impl Candidate {
     }
 
     fn has_majority_votes(&mut self) -> bool {
-        if let None = self.result {
+        if self.result.is_none() {
             if let Ok(Async::Ready(ans)) = self.future.poll() {
                 self.result = Some(ans);
             }
@@ -241,7 +241,7 @@ impl Leader {
                 return *i;
             }
         }
-        return 0;
+        0
     }
 
     fn needs_heartbeat(&self, id: &ServerId) -> bool {
@@ -272,8 +272,8 @@ impl Leader {
             }
         }
         self.followers.push(RemoteServer {
-            id: id.clone(),
-            next_index: next_index,
+            id: *id,
+            next_index,
             match_index: 0,
             last_sent: Instant::now(),
             last_append_entries: Some(request),
@@ -298,13 +298,13 @@ impl<E: error::Error> Raft<E> {
     ) -> Self {
         let majority = 1 + (servers.len() / 2);
         Raft {
-            id: id,
+            id,
             state: RaftState::Follower(Follower::new()),
-            storage: storage,
+            storage,
             commit_index: 0,
             last_applied: 0,
             known_peers: servers.into_iter().filter(|&x| x != id).collect(),
-            majority: majority,
+            majority,
         }
     }
 
@@ -332,7 +332,7 @@ impl<E: error::Error> Raft<E> {
         self.storage.set_voted_for(Some(self.id))?;
         let last_log_entry = self.storage.last_log_entry()?;
         let request = RequestVoteRequest {
-            term: term,
+            term,
             candidate_id: self.id,
             last_log_index: last_log_entry.map_or(0, |(i, _t)| i),
             last_log_term: last_log_entry.map_or(0, |(_i, t)| t),
@@ -384,7 +384,7 @@ impl<E: error::Error> Raft<E> {
                     term: current_term,
                     leader_id: self.id,
                     prev_log_index: next_index,
-                    entries: entries,
+                    entries,
                     leader_commit: self.commit_index,
                 };
 
@@ -522,11 +522,11 @@ mod tests {
         leader_commit: LogIndex,
     ) -> AppendEntriesRequest {
         AppendEntriesRequest {
-            term: term,
+            term,
             leader_id: ([127, 0, 0, 1], 8080).into(),
-            prev_log_index: prev_log_index,
+            prev_log_index,
             entries: Vec::new(),
-            leader_commit: leader_commit,
+            leader_commit,
         }
     }
 
