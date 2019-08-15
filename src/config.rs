@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 
+#[derive(Clone)]
 pub struct RaftConfig {
     pub server_addr: SocketAddr,
     pub peers: Vec<SocketAddr>,

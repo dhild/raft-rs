@@ -3,7 +3,7 @@ extern crate clap;
 extern crate env_logger;
 #[macro_use]
 extern crate log;
-extern crate raft_rs;
+extern crate raft;
 
 use clap::{App, ArgMatches};
 use env_logger::Builder;
@@ -23,7 +23,7 @@ fn main_code() -> i32 {
 
     setup_logging(&matches);
 
-    let mut config = raft_rs::RaftConfig::default();
+    let mut config = raft::RaftConfig::default();
     if let Some(addr) = matches.value_of("address") {
         match addr.parse() {
             Ok(addr) => config.server_addr = addr,
@@ -46,7 +46,7 @@ fn main_code() -> i32 {
     }
 
     match matches.subcommand() {
-        ("serve", Some(_serve_matches)) => raft_rs::serve(config),
+        ("serve", Some(_serve_matches)) => raft::serve(config),
         _ => {
             error!("No subcommand matched!");
             return 2;

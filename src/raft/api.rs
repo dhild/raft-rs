@@ -1,18 +1,31 @@
-use futures::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::net::SocketAddr;
 
-pub type Term = u32;
 pub type ServerId = SocketAddr;
-pub type LogCommand = String;
+pub type Term = u32;
 pub type LogIndex = usize;
 
-#[derive(Serialize, Deserialize, Debug, Eq, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub enum StateCommand {
+    Noop,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct LogEntry {
     pub term: Term,
     pub index: LogIndex,
-    pub command: LogCommand,
+    pub command: StateCommand,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Status {
+    pub leader: Option<ServerId>,
+    pub peers: Vec<ServerId>,
+    pub last_log_term: Option<Term>,
+    pub last_log_index: Option<LogIndex>,
+    pub commit_index: LogIndex,
+    pub last_applied: LogIndex,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -30,9 +43,6 @@ pub struct AppendEntriesResponse {
     pub success: bool,
 }
 
-pub type FutureAppendEntriesResponse =
-    Box<dyn Send + Future<Item = (AppendEntriesRequest, AppendEntriesResponse), Error = ()>>;
-
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct RequestVoteRequest {
     pub term: Term,
@@ -46,9 +56,6 @@ pub struct RequestVoteResponse {
     pub term: Term,
     pub vote_granted: bool,
 }
-
-pub type FutureRequestVoteResponse =
-    Box<dyn Send + Future<Item = (RequestVoteRequest, RequestVoteResponse), Error = ()>>;
 
 impl Ord for LogEntry {
     fn cmp(&self, other: &Self) -> Ordering {
@@ -64,18 +71,10 @@ impl PartialOrd for LogEntry {
     }
 }
 
+impl Eq for LogEntry {}
+
 impl PartialEq for LogEntry {
     fn eq(&self, other: &Self) -> bool {
         self.index == other.index && self.term == other.term
     }
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct Status {
-    pub leader: Option<ServerId>,
-    pub peers: Vec<ServerId>,
-    pub last_log_term: Option<Term>,
-    pub last_log_index: Option<LogIndex>,
-    pub commit_index: LogIndex,
-    pub last_applied: LogIndex,
 }

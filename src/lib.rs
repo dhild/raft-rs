@@ -5,11 +5,11 @@ extern crate hyper;
 extern crate serde;
 extern crate tokio_timer;
 
-pub mod client;
+mod client;
 mod config;
 pub mod raft;
 mod server;
-mod storage;
 
+pub use client::{Client, Health};
 pub use config::RaftConfig;
-pub use server::{ServerFuture, run_serve, serve};
+pub use server::{new_server, ServerFuture, Error as ServerError};
