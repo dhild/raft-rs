@@ -1,14 +1,15 @@
-use futures::future::{ok, Future, IntoFuture};
-use futures::sync::oneshot::{channel, Sender};
 use raft_rs::*;
 use std::net::SocketAddr;
+use crossbeam_channel::{bounded, Sender};
 
 pub fn three_servers() -> ThreeServers {
     let addr1 = ([127, 0, 0, 1], 8080).into();
     let addr2 = ([127, 0, 0, 1], 8081).into();
     let addr3 = ([127, 0, 0, 1], 8082).into();
-    let (stop, rx) = channel();
-    let rx = rx.shared();
+    let (stop, rx) = bounded(1);
+    let rx1 = rx.shared();
+    let rx2 = rx.shared();
+    let rx3 = rx.shared();
     let server1 = new_server(
         RaftConfig {
             server_addr: addr1,
@@ -41,23 +42,13 @@ pub fn three_servers() -> ThreeServers {
 }
 
 pub struct ThreeServers {
-    addr1: SocketAddr,
-    addr2: SocketAddr,
-    addr3: SocketAddr,
+    pub addr1: SocketAddr,
+    pub addr2: SocketAddr,
+    pub addr3: SocketAddr,
     stop: Sender<()>,
-    future: Box<dyn Future<Item = ((), (), (), ()), Error = ServerError> + Send>,
 }
 
 impl ThreeServers {
-    pub fn addr1(&self) -> SocketAddr {
-        self.addr1
-    }
-    pub fn addr2(&self) -> SocketAddr {
-        self.addr2
-    }
-    pub fn addr3(&self) -> SocketAddr {
-        self.addr3
-    }
 }
 
 pub fn run_server_test<E, F>(server: ThreeServers, test: F)

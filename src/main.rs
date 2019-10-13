@@ -5,6 +5,8 @@ extern crate env_logger;
 extern crate log;
 extern crate raft;
 
+mod config;
+
 use clap::{App, ArgMatches};
 use env_logger::Builder;
 use log::LevelFilter;
@@ -23,10 +25,10 @@ fn main_code() -> i32 {
 
     setup_logging(&matches);
 
-    let mut config = raft::RaftConfig::default();
+    let mut cfg = config::RaftConfig::default();
     if let Some(addr) = matches.value_of("address") {
         match addr.parse() {
-            Ok(addr) => config.server_addr = addr,
+            Ok(addr) => cfg.server_addr = addr,
             Err(e) => {
                 error!("Could not parse server address: {}", e);
                 return 1;
@@ -36,7 +38,7 @@ fn main_code() -> i32 {
     if let Some(peers) = matches.values_of("peer") {
         for addr in peers {
             match addr.parse() {
-                Ok(addr) => config.peers.push(addr),
+                Ok(addr) => cfg.peers.push(addr),
                 Err(e) => {
                     error!("Could not parse peer address '{}': {}", addr, e);
                     return 1;
@@ -46,7 +48,7 @@ fn main_code() -> i32 {
     }
 
     match matches.subcommand() {
-        ("serve", Some(_serve_matches)) => raft::serve(config),
+        ("serve", Some(_serve_matches)) => core::serve(cfg),
         _ => {
             error!("No subcommand matched!");
             return 2;

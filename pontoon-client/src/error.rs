@@ -1,9 +1,11 @@
 use std::error;
 use std::fmt;
 
+pub type Result<T> = std::result::Result<T, Error>;
+
 #[derive(Debug)]
 pub enum Error {
-    REST(hyper::Error),
+    REST(http_req::error::Error),
     JSON(serde_json::error::Error),
 }
 
@@ -28,5 +30,17 @@ impl error::Error for Error {
             Error::REST(ref e) => Some(e),
             Error::JSON(ref e) => Some(e),
         }
+    }
+}
+
+impl From<http_req::error::Error> for Error {
+    fn from(e: http_req::error::Error) -> Error {
+        Error::REST(e)
+    }
+}
+
+impl From<serde_json::error::Error> for Error {
+    fn from(e: serde_json::error::Error) -> Error {
+        Error::JSON(e)
     }
 }

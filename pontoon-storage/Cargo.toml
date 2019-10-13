@@ -1,0 +1,24 @@
+[package]
+name = "pontoon-storage"
+version = "0.1.0"
+authors = ["D. Ryan Hild <d.ryan.hild@gmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[features]
+default = ["disk"]
+disk = ["serde", "serde_json"]
+
+[dependencies]
+pontoon-core = { version = "0.1.0", path = "../pontoon-core" }
+log = "^0"
+
+[dependencies.serde]
+version = "^1"
+features = ["derive"]
+optional = true
+
+[dependencies.serde_json]
+version = "^1"
+optional = true

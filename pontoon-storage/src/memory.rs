@@ -1,20 +1,41 @@
-mod error;
-pub use error::{Error, Result};
+use crate::error::{Error, Result};
+use pontoon_core::*;
 
-use crate::raft::*;
-use serde::{Deserialize, Serialize};
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-struct Metadata {
+#[derive(Debug, Clone)]
+pub struct Metadata {
     current_term: Term,
     voted_for: Option<ServerId>,
     log_entries: Vec<LogEntry>,
 }
 
-pub trait Storage {
-    fn read(&self) -> Result<Metadata>;
+pub struct InMemoryStorage {
+    meta: Metadata,
+}
 
-    fn write(&mut self, meta: Metadata) -> Result<()>;
+impl InMemoryStorage {
+    fn read(&self) -> Result<Metadata> {
+        Ok(self.meta.clone())
+    }
+    fn write(&mut self, meta: Metadata) -> Result<()> {
+        self.meta = meta;
+        Ok(())
+    }
+}
+
+impl Default for InMemoryStorage {
+    fn default() -> Self {
+        InMemoryStorage {
+            meta: Metadata {
+                current_term: 0,
+                voted_for: None,
+                log_entries: Vec::new(),
+            },
+        }
+    }
+}
+
+impl Storage for InMemoryStorage {
+    type Error = Error;
 
     fn current_term(&self) -> Result<Term> {
         self.read().map(|m| m.current_term)
@@ -97,31 +118,5 @@ pub trait Storage {
                 .find(|entry| entry.index == index)
                 .map(|entry| entry.term)
         })
-    }
-}
-
-pub struct InMemoryStorage {
-    meta: Metadata,
-}
-
-impl Storage for InMemoryStorage {
-    fn read(&self) -> Result<Metadata> {
-        Ok(self.meta.clone())
-    }
-    fn write(&mut self, meta: Metadata) -> Result<()> {
-        self.meta = meta;
-        Ok(())
-    }
-}
-
-impl Default for InMemoryStorage {
-    fn default() -> Self {
-        InMemoryStorage {
-            meta: Metadata {
-                current_term: 0,
-                voted_for: None,
-                log_entries: Vec::new(),
-            },
-        }
     }
 }

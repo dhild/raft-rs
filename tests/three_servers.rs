@@ -1,15 +1,12 @@
 extern crate env_logger;
 #[macro_use]
 extern crate log;
-extern crate hyper;
-extern crate tokio_timer;
+extern crate crossbeam_channel;
 
 mod common;
 
-use futures::future::{loop_fn, Future, Loop};
 use raft_rs::*;
 use std::time::{Duration, Instant};
-use tokio_timer::Delay;
 
 #[test]
 fn three_servers_leader_matches() {
