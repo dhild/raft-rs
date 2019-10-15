@@ -2,7 +2,6 @@ use crossbeam_channel::Sender;
 use std::collections::HashMap;
 use std::time::Instant;
 
-use crate::configuration::ServerId;
 use crate::rpc::AppendEntriesRequest;
 
 pub enum RaftState {
@@ -25,7 +24,7 @@ pub struct Follower {
 }
 
 impl Follower {
-    pub fn into_candidate(&self) -> Candidate {
+    pub fn to_candidate(&self) -> Candidate {
         Candidate {}
     }
 }
@@ -33,12 +32,12 @@ impl Follower {
 pub struct Candidate {}
 
 impl Candidate {
-    pub fn into_follower(&self) -> Follower {
+    pub fn to_follower(&self) -> Follower {
         Follower {
             last_contact_time: Instant::now(),
         }
     }
-    pub fn into_leader(&self) -> Leader {
+    pub fn to_leader(&self) -> Leader {
         Leader {
             servers: HashMap::new(),
         }
@@ -46,11 +45,11 @@ impl Candidate {
 }
 
 pub struct Leader {
-    servers: HashMap<ServerId, Sender<AppendEntriesRequest>>,
+    servers: HashMap<String, Sender<AppendEntriesRequest>>,
 }
 
 impl Leader {
-    pub fn into_follower(&self) -> Follower {
+    pub fn to_follower(&self) -> Follower {
         Follower {
             last_contact_time: Instant::now(),
         }

@@ -1,12 +1,14 @@
 //! Types for working with log data that raft uses to represent the current state.
 use std::cmp::Ordering;
 
-use crate::ServerId;
+#[cfg(feature = "http-transport")]
+use serde::{Deserialize, Serialize};
 
 pub type Term = u32;
 pub type LogIndex = usize;
 
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "http-transport", derive(Serialize, Deserialize))]
 pub struct LogEntry {
     pub term: Term,
     pub index: LogIndex,
@@ -14,6 +16,7 @@ pub struct LogEntry {
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "http-transport", derive(Serialize, Deserialize))]
 pub enum LogCommand {
     Noop,
     StateMachine(Vec<u8>),
@@ -51,8 +54,8 @@ pub trait Storage: Sized + Send {
     fn current_term(&self) -> Term;
     fn set_current_term(&mut self, t: Term) -> Result<(), Self::Error>;
 
-    fn voted_for(&self) -> Option<ServerId>;
-    fn set_voted_for(&mut self, candidate: Option<ServerId>) -> Result<(), Self::Error>;
+    fn voted_for(&self) -> Option<String>;
+    fn set_voted_for(&mut self, candidate: Option<String>) -> Result<(), Self::Error>;
 
     fn last_log_entry(&self) -> Option<(LogIndex, Term)>;
 
@@ -65,7 +68,7 @@ pub trait Storage: Sized + Send {
 /// Storage without true persistence; all data is lost on process restart.
 pub struct InMemoryStorage {
     term: Term,
-    voted_for: Option<ServerId>,
+    voted_for: Option<String>,
     log_entries: Vec<LogEntry>,
 }
 
@@ -80,10 +83,10 @@ impl Storage for InMemoryStorage {
         Ok(())
     }
 
-    fn voted_for(&self) -> Option<ServerId> {
+    fn voted_for(&self) -> Option<String> {
         self.voted_for.clone()
     }
-    fn set_voted_for(&mut self, candidate: Option<ServerId>) -> Result<(), Self::Error> {
+    fn set_voted_for(&mut self, candidate: Option<String>) -> Result<(), Self::Error> {
         self.voted_for = candidate;
         Ok(())
     }

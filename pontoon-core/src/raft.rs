@@ -5,7 +5,7 @@ use std::result::Result;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::configuration::{ConfigurationState, Server, ServerId};
+use crate::configuration::{ConfigurationState, Server};
 use crate::fsm::FiniteStateMachine;
 use crate::logs::{LogIndex, Storage, Term};
 use crate::rpc::*;
@@ -13,7 +13,7 @@ use crate::state::*;
 
 /// Used to construct a `Raft` object.
 pub struct RaftBuilder {
-    pub id: ServerId,
+    pub id: String,
     pub address: SocketAddr,
     pub election_timeout: Duration,
     pub heartbeat_timeout: Duration,
@@ -42,7 +42,7 @@ impl RaftBuilder {
             address: self.address,
             election_timeout: self.election_timeout,
             heartbeat_timeout: self.heartbeat_timeout,
-            configuration: ConfigurationState::default(),
+            configuration: ConfigurationState::new(self.id.clone(), self.address),
             commit_index: 0,
             last_applied: 0,
             state: RaftState::default(),
@@ -54,7 +54,7 @@ impl RaftBuilder {
 }
 
 pub struct Raft<F: FiniteStateMachine, S: Storage, T: Transport> {
-    id: ServerId,
+    id: String,
     address: SocketAddr,
     election_timeout: Duration,
     heartbeat_timeout: Duration,
@@ -93,8 +93,8 @@ where
                     self.state = RaftState::ShuttingDown;
                 }
                 recv(timeout) -> _ => {
-                    warn!("Election timeout reached, starting election");
-                    self.state = RaftState::Candidate(follower.into_candidate());
+                    info!("Election timeout reached, starting election");
+                    self.state = RaftState::Candidate(follower.to_candidate());
                 }
             };
         }
@@ -124,7 +124,7 @@ where
                         Ok(RequestVoteResult{id, result}) => {
                             if result.term > current_term {
                                 info!("Newer term discovered as candidate, switching to follower");
-                                self.state = RaftState::Follower(candidate.into_follower());
+                                self.state = RaftState::Follower(candidate.to_follower());
                                 if let Err(e) = self.storage.set_current_term(result.term) {
                                     error!("Failed to set current term to {}: {}", result.term, e);
                                 }
@@ -133,7 +133,7 @@ where
                                 debug!("Vote granted from {}; tally: {}", id, votes_granted);
                                 if votes_granted >= votes_needed {
                                     info!("Won election {} with {} votes", current_term, votes_granted);
-                                    self.state = RaftState::Leader(candidate.into_leader());
+                                    self.state = RaftState::Leader(candidate.to_leader());
                                 }
                             }
                         }
@@ -202,7 +202,7 @@ where
                     let resp = resp.unwrap();
                     if resp.term > current_term {
                         info!("Newer term discovered as leader, switching to follower");
-                        self.state = RaftState::Follower(leader.into_follower());
+                        self.state = RaftState::Follower(leader.to_follower());
                         if let Err(e) = self.storage.set_current_term(resp.term) {
                             error!("Failed to set current term to {}: {}", resp.term, e);
                         }
@@ -306,11 +306,11 @@ where
             match &self.state {
                 RaftState::Candidate(c) => {
                     info!("converting from candidate to follower");
-                    self.state = RaftState::Follower(c.into_follower())
+                    self.state = RaftState::Follower(c.to_follower())
                 }
                 RaftState::Leader(l) => {
                     info!("converting from leader to follower");
-                    self.state = RaftState::Follower(l.into_follower())
+                    self.state = RaftState::Follower(l.to_follower())
                 }
                 _ => (),
             };
@@ -469,8 +469,23 @@ where
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::fsm::KeyValueStore;
+    use crate::logs::InMemoryStorage;
+    use crate::rpc::HttpTransport;
+
+    fn basic_raft() -> Raft<KeyValueStore, InMemoryStorage, HttpTransport> {
+        new("unique-raft-id", ([127, 0, 0, 1], 8080)).build(
+            KeyValueStore::default(),
+            InMemoryStorage::default(),
+            HttpTransport::default(),
+        )
+    }
+
     #[test]
-    fn it_works() {
-        assert_eq!(2 + 2, 4);
+    fn raft_is_self_voter_at_start() {
+        let raft = basic_raft();
+
+        assert_eq!(1, raft.configuration.latest().count_voters());
     }
 }

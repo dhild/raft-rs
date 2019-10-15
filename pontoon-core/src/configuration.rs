@@ -2,20 +2,18 @@ use std::net::SocketAddr;
 
 use crate::LogIndex;
 
-pub type ServerId = String;
-
 #[derive(Debug, Clone)]
 pub struct Server {
-    pub id: ServerId,
+    pub id: String,
     pub address: SocketAddr,
     pub voter: bool,
 }
 
 pub enum ConfigurationChange {
-    AddNonVoter(ServerId, SocketAddr),
-    DemoteVoter(ServerId),
-    RemoveServer(ServerId),
-    Promote(ServerId),
+    AddNonVoter(String, SocketAddr),
+    DemoteVoter(String),
+    RemoveServer(String),
+    Promote(String),
 }
 
 pub struct Configuration {
@@ -24,7 +22,18 @@ pub struct Configuration {
 }
 
 impl Configuration {
-    pub fn has_vote(&self, id: &ServerId) -> bool {
+    fn new(id: String, address: SocketAddr) -> Configuration {
+        Configuration {
+            servers: vec![Server {
+                id,
+                address,
+                voter: true,
+            }],
+            majority: 1,
+        }
+    }
+
+    pub fn has_vote(&self, id: &str) -> bool {
         self.servers.iter().any(|x| id == &x.id && x.voter)
     }
 
@@ -44,11 +53,12 @@ impl Configuration {
         self.servers.clone()
     }
 
-    fn majority(servers: &Vec<Server>) -> usize {
-        match servers.iter().filter(|x| x.voter).count() {
+    fn updated(servers: Vec<Server>) -> Configuration {
+        let majority = match servers.iter().filter(|x| x.voter).count() {
             x if x < 3 => x,
             x => (x + 1) / 2,
-        }
+        };
+        Configuration { servers, majority }
     }
 
     pub fn apply_change(&self, change: &ConfigurationChange) -> Configuration {
@@ -72,14 +82,12 @@ impl Configuration {
                         s.voter = false
                     }
                 }
-                let majority = Self::majority(&servers);
-                Configuration { servers, majority }
+                Self::updated(servers)
             }
             ConfigurationChange::RemoveServer(id) => {
                 let mut servers = self.servers.clone();
                 servers.retain(|s| &s.id != id);
-                let majority = Self::majority(&servers);
-                Configuration { servers, majority }
+                Self::updated(servers)
             }
             ConfigurationChange::Promote(id) => {
                 let mut servers = self.servers.clone();
@@ -88,18 +96,8 @@ impl Configuration {
                         s.voter = true
                     }
                 }
-                let majority = Self::majority(&servers);
-                Configuration { servers, majority }
+                Self::updated(servers)
             }
-        }
-    }
-}
-
-impl Default for Configuration {
-    fn default() -> Self {
-        Configuration {
-            servers: Vec::new(),
-            majority: 0,
         }
     }
 }
@@ -110,16 +108,14 @@ pub enum ConfigurationState {
 }
 
 impl ConfigurationState {
+    pub fn new(id: String, address: SocketAddr) -> ConfigurationState {
+        ConfigurationState::Committed(0, Configuration::new(id, address))
+    }
+
     pub fn latest(&self) -> &Configuration {
         match self {
             ConfigurationState::Committed(_, c) => c,
             ConfigurationState::Latest(_, _, c) => c,
         }
-    }
-}
-
-impl Default for ConfigurationState {
-    fn default() -> Self {
-        ConfigurationState::Committed(0, Configuration::default())
     }
 }

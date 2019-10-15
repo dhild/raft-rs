@@ -8,8 +8,6 @@ edition = "2018"
 members = [
   "pontoon-client",
   "pontoon-core",
-  "pontoon-server",
-  "pontoon-storage",
 ]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html

@@ -15,13 +15,15 @@
 //! ```
 #![feature(never_type)]
 
-extern crate crossbeam_channel;
+pub extern crate crossbeam_channel;
+pub extern crate futures;
 extern crate log;
-#[cfg(feature = "json")]
+#[cfg(any(feature = "http-transport", feature = "key-value-store"))]
 extern crate serde;
-#[cfg(feature = "json")]
+#[cfg(any(feature = "http-transport", feature = "key-value-store"))]
 extern crate serde_json;
-extern crate threadpool;
+#[cfg(feature = "http-transport")]
+extern crate hyper;
 
 mod configuration;
 pub mod fsm;
@@ -30,7 +32,6 @@ mod raft;
 pub mod rpc;
 mod state;
 
-pub use configuration::ServerId;
 pub use fsm::FiniteStateMachine;
 pub use logs::{LogCommand, LogEntry, LogIndex, Storage, Term};
 pub use raft::{new, Raft};
