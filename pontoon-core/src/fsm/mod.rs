@@ -5,7 +5,6 @@ mod kvs;
 #[cfg(feature = "key-value-store")]
 pub use kvs::*;
 
-use std::collections::HashMap;
 use std::io;
 use std::result::Result;
 
@@ -17,23 +16,23 @@ pub trait FiniteStateMachine: Sized + Send {
     type QueryResponse: Serializable<Self::Error>;
 
     /// Accepts a binary command, applying it to the state machine.
-    fn command(&mut self, command: Self::Command) -> Result<(), Self::Error>;
+    fn command(&mut self, command: Self::Command);
 
     /// Processes a query, returning some data concerning the current state.
-    fn query(&self, query: &Self::Query) -> Result<Self::QueryResponse, Self::Error>;
+    fn query(&self, query: Self::Query) -> Result<Self::QueryResponse, Self::Error>;
 
     /// Records the current state of the `FiniteStateMachine` so that it can be restored later.
-    fn take_snapshot<W: io::Write>(&self, w: &mut W) -> Result<(), Self::Error>;
+    fn take_snapshot<W: io::Write>(&self, w: W) -> Result<(), Self::Error>;
 
     /// Restores the `FiniteStateMachine` from a snapshot written with `take_snapshot`.
-    fn restore_snapshot<R: io::Read>(&mut self, r: &mut R) -> Result<(), Self::Error>;
+    fn restore_snapshot<R: io::Read>(&mut self, r: R) -> Result<(), Self::Error>;
 }
 
 /// An object that can be written to or read from a byte stream.
 pub trait Serializable<E>: Sized + Send {
     /// Reads a command from the given byte stream.
-    fn deserialize<R: io::Read>(reader: &mut R) -> Result<Self, E>;
+    fn deserialize<R: io::Read>(reader: R) -> Result<Self, E>;
 
     /// Writes a command to the given byte stream.
-    fn serialize<W: io::Write>(&self, writer: &mut W) -> Result<(), E>;
+    fn serialize<W: io::Write>(&self, writer: W) -> Result<(), E>;
 }

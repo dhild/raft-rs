@@ -1,5 +1,8 @@
 use std::net::SocketAddr;
 
+#[cfg(feature = "http-transport")]
+use serde::{Deserialize, Serialize};
+
 use crate::LogIndex;
 
 #[derive(Debug, Clone)]
@@ -9,6 +12,8 @@ pub struct Server {
     pub voter: bool,
 }
 
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "http-transport", derive(Serialize, Deserialize))]
 pub enum ConfigurationChange {
     AddNonVoter(String, SocketAddr),
     DemoteVoter(String),
@@ -21,20 +26,18 @@ pub struct Configuration {
     majority: usize,
 }
 
-impl Configuration {
-    fn new(id: String, address: SocketAddr) -> Configuration {
+impl Default for Configuration {
+    fn default() -> Self {
         Configuration {
-            servers: vec![Server {
-                id,
-                address,
-                voter: true,
-            }],
+            servers: Vec::new(),
             majority: 1,
         }
     }
+}
 
+impl Configuration {
     pub fn has_vote(&self, id: &str) -> bool {
-        self.servers.iter().any(|x| id == &x.id && x.voter)
+        self.servers.iter().any(|x| id == x.id && x.voter)
     }
 
     pub fn quorum_size(&self) -> usize {
@@ -108,14 +111,16 @@ pub enum ConfigurationState {
 }
 
 impl ConfigurationState {
-    pub fn new(id: String, address: SocketAddr) -> ConfigurationState {
-        ConfigurationState::Committed(0, Configuration::new(id, address))
-    }
-
     pub fn latest(&self) -> &Configuration {
         match self {
             ConfigurationState::Committed(_, c) => c,
             ConfigurationState::Latest(_, _, c) => c,
         }
+    }
+}
+
+impl Default for ConfigurationState {
+    fn default() -> Self {
+        ConfigurationState::Committed(0, Configuration::default())
     }
 }

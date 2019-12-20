@@ -4,6 +4,8 @@ use std::cmp::Ordering;
 #[cfg(feature = "http-transport")]
 use serde::{Deserialize, Serialize};
 
+use crate::configuration::ConfigurationChange;
+
 pub type Term = u32;
 pub type LogIndex = usize;
 
@@ -19,6 +21,7 @@ pub struct LogEntry {
 #[cfg_attr(feature = "http-transport", derive(Serialize, Deserialize))]
 pub enum LogCommand {
     Noop,
+    ConfigurationChange(ConfigurationChange),
     StateMachine(Vec<u8>),
 }
 

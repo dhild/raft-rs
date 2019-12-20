@@ -9,7 +9,7 @@
 //! ```
 //! let fsm = pontoon_core::fsm::KeyValueStore::default();
 //! let storage = pontoon_core::logs::InMemoryStorage::default();
-//! let transport = pontoon_core::rpc::HttpTransport::default();
+//! let transport = pontoon_core::rpc::LoopbackTransport::default();
 //! let raft = pontoon_core::new("unique-raft-id", ([127, 0, 0, 1], 8080))
 //!              .build(fsm, storage, transport);
 //! ```

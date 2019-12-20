@@ -94,24 +94,20 @@ impl HttpTransport {
             .request(req)
             .map_err(|e| {
                 error!("failed to send request: {}", e);
-                ()
             })
             .and_then(|res| {
                 res.into_body().concat2().map_err(|e| {
                     error!("failed to receive response: {}", e);
-                    ()
                 })
             })
             .and_then(|body| {
                 serde_json::from_slice(&body).map_err(|e| {
                     error!("failed to parse response: {}", e);
-                    ()
                 })
             })
             .and_then(move |res| {
                 results.send(res).map_err(|e| {
                     error!("failed to record response: {}", e);
-                    ()
                 })
             });
         hyper::rt::spawn(request);

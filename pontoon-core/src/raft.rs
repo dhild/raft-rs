@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use crate::configuration::{ConfigurationState, Server};
 use crate::fsm::FiniteStateMachine;
-use crate::logs::{LogIndex, Storage, Term};
+use crate::logs::{LogCommand, LogEntry, LogIndex, Storage, Term};
 use crate::rpc::*;
 use crate::state::*;
 
@@ -25,7 +25,7 @@ pub fn new<S: Into<SocketAddr>>(id: &str, address: S) -> RaftBuilder {
         id: String::from(id),
         address: address.into(),
         election_timeout: Duration::from_secs(1),
-        heartbeat_timeout: Duration::from_secs(1),
+        heartbeat_timeout: Duration::from_millis(50),
     }
 }
 
@@ -37,12 +37,25 @@ impl RaftBuilder {
         S: Storage,
         T: Transport + 'static,
     {
+        let mut configuration = ConfigurationState::default();
+        let (last_index, _) = storage.last_log_entry().unwrap_or_default();
+        for i in 0..last_index {
+            if let Ok(Some(LogEntry {
+                command: LogCommand::ConfigurationChange(c),
+                ..
+            })) = storage.get(i)
+            {
+                let c2 = configuration.latest().apply_change(&c);
+                configuration = ConfigurationState::Committed(i, c2);
+            }
+        }
+
         Raft {
             id: self.id.clone(),
             address: self.address,
             election_timeout: self.election_timeout,
             heartbeat_timeout: self.heartbeat_timeout,
-            configuration: ConfigurationState::new(self.id.clone(), self.address),
+            configuration,
             commit_index: 0,
             last_applied: 0,
             state: RaftState::default(),
@@ -50,6 +63,16 @@ impl RaftBuilder {
             state_machine: Arc::new(Mutex::new(state_machine)),
             transport: Arc::new(Mutex::new(transport)),
         }
+    }
+
+    /// Initializes a new `Raft` object using default objects.
+    pub fn build_defaults<F, S, T>(&self) -> Raft<F, S, T>
+    where
+        F: FiniteStateMachine + Default,
+        S: Storage + Default,
+        T: Transport + Default + 'static,
+    {
+        self.build(F::default(), S::default(), T::default())
     }
 }
 
@@ -69,33 +92,69 @@ pub struct Raft<F: FiniteStateMachine, S: Storage, T: Transport> {
 
 impl<F, S, T> Raft<F, S, T>
 where
-    F: FiniteStateMachine,
+    F: FiniteStateMachine + 'static,
     S: Storage,
     T: Transport + 'static,
 {
     pub fn run(&mut self, shutdown: Receiver<()>) {
+        let (state_tx, state_handler) = self.start_state_handler(&shutdown);
         loop {
             match self.state {
                 RaftState::Follower(_) => self.run_follower(&shutdown),
                 RaftState::Candidate(_) => self.run_candidate(&shutdown),
                 RaftState::Leader(_) => self.run_leader(&shutdown),
-                RaftState::ShuttingDown => return,
+                RaftState::ShuttingDown => break,
             }
         }
+        state_handler.join().unwrap();
+    }
+
+    fn start_state_handler(
+        &mut self,
+        shutdown: &Receiver<()>,
+    ) -> (
+        crossbeam_channel::Sender<F::Command>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let shutdown = shutdown.clone();
+        let state_machine = self.state_machine.clone();
+        let (tx, rx) = crossbeam_channel::unbounded::<F::Command>();
+        let handle = std::thread::Builder::new()
+            .name("raft-state-machine".to_string())
+            .spawn(move || loop {
+                select! {
+                    recv(rx) -> cmd => {
+                        if let Err(e) = cmd {
+                            error!("state machine error: {}", e);
+                            return;
+                        }
+                        let cmd = cmd.unwrap();
+                        let mut sm = state_machine.lock().unwrap();
+                        sm.command(cmd);
+                    }
+                    recv(shutdown) -> _ => {
+                        debug!("Shutdown signal received");
+                        return;
+                    }
+                };
+            })
+            .expect("Failed to start raft state machine thread");
+        (tx, handle)
     }
 
     fn run_follower(&mut self, shutdown: &Receiver<()>) {
-        let timeout = crossbeam_channel::after(self.election_timeout);
         while let RaftState::Follower(ref follower) = self.state {
+            if follower.duration_since_last_contact() > self.election_timeout {
+                info!("Election timeout reached, starting election");
+                self.state = RaftState::Candidate(follower.to_candidate());
+                return;
+            }
             select! {
                 recv(shutdown) -> _ => {
                     debug!("Shutdown signal received");
                     self.state = RaftState::ShuttingDown;
                 }
-                recv(timeout) -> _ => {
-                    info!("Election timeout reached, starting election");
-                    self.state = RaftState::Candidate(follower.to_candidate());
-                }
+                default(self.election_timeout) => {}
             };
         }
     }
@@ -108,12 +167,16 @@ where
                 return;
             }
         };
-        let timeout = crossbeam_channel::after(self.election_timeout);
         let votes_needed = self.configuration.latest().quorum_size();
         let mut votes_granted = 0;
         let current_term = self.storage.current_term();
 
         while let RaftState::Candidate(candidate) = &self.state {
+            if candidate.duration_since_start() > self.election_timeout {
+                info!("Election timeout reached, starting new election");
+                self.state = RaftState::Candidate(candidate.new_election());
+                return;
+            }
             select! {
                 recv(votes) -> voter => {
                     match voter {
@@ -144,10 +207,7 @@ where
                     self.state = RaftState::ShuttingDown;
                     return
                 },
-                recv(timeout) -> _ => {
-                    warn!("Election timeout reached, restarting election");
-                    return
-                },
+                default(self.election_timeout) => {}
             };
         }
     }
@@ -472,14 +532,10 @@ mod tests {
     use super::*;
     use crate::fsm::KeyValueStore;
     use crate::logs::InMemoryStorage;
-    use crate::rpc::HttpTransport;
+    use crate::rpc::LoopbackTransport;
 
-    fn basic_raft() -> Raft<KeyValueStore, InMemoryStorage, HttpTransport> {
-        new("unique-raft-id", ([127, 0, 0, 1], 8080)).build(
-            KeyValueStore::default(),
-            InMemoryStorage::default(),
-            HttpTransport::default(),
-        )
+    fn basic_raft() -> Raft<KeyValueStore, InMemoryStorage, LoopbackTransport> {
+        new("unique-raft-id", ([127, 0, 0, 1], 8080)).build_defaults()
     }
 
     #[test]

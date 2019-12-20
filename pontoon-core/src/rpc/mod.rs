@@ -100,3 +100,49 @@ pub trait Transport: Send {
         results: crossbeam_channel::Sender<RequestVoteResult>,
     );
 }
+
+/// A simple transport which can be invoked programmatically.
+pub struct LoopbackTransport {
+    server_tx: crossbeam_channel::Sender<RPC>,
+    server_rx: crossbeam_channel::Receiver<RPC>,
+}
+
+impl Default for LoopbackTransport {
+    fn default() -> Self {
+        let (server_tx, server_rx) = crossbeam_channel::unbounded();
+        LoopbackTransport {
+            server_tx,
+            server_rx,
+        }
+    }
+}
+
+impl Transport for LoopbackTransport {
+    fn incoming(&mut self) -> crossbeam_channel::Receiver<RPC> {
+        self.server_rx.clone()
+    }
+
+    fn append_entries(
+        &mut self,
+        _id: String,
+        _target: SocketAddr,
+        req: &AppendEntriesRequest,
+        results: crossbeam_channel::Sender<AppendEntriesResult>,
+    ) {
+        self.server_tx
+            .send(RPC::AppendEntries(req.clone(), results))
+            .unwrap()
+    }
+
+    fn request_vote(
+        &mut self,
+        _id: String,
+        _target: SocketAddr,
+        req: &RequestVoteRequest,
+        results: crossbeam_channel::Sender<RequestVoteResult>,
+    ) {
+        self.server_tx
+            .send(RPC::RequestVote(req.clone(), results))
+            .unwrap()
+    }
+}

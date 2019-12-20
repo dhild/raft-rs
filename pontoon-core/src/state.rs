@@ -1,6 +1,6 @@
 use crossbeam_channel::Sender;
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::rpc::AppendEntriesRequest;
 
@@ -20,16 +20,24 @@ impl Default for RaftState {
 }
 
 pub struct Follower {
-    last_contact_time: Instant,
+    pub last_contact_time: Instant,
 }
 
 impl Follower {
     pub fn to_candidate(&self) -> Candidate {
-        Candidate {}
+        Candidate {
+            election_start: Instant::now(),
+        }
+    }
+
+    pub fn duration_since_last_contact(&self) -> Duration {
+        Instant::now().duration_since(self.last_contact_time)
     }
 }
 
-pub struct Candidate {}
+pub struct Candidate {
+    pub election_start: Instant,
+}
 
 impl Candidate {
     pub fn to_follower(&self) -> Follower {
@@ -41,6 +49,15 @@ impl Candidate {
         Leader {
             servers: HashMap::new(),
         }
+    }
+    pub fn new_election(&self) -> Candidate {
+        Candidate {
+            election_start: Instant::now(),
+        }
+    }
+
+    pub fn duration_since_start(&self) -> Duration {
+        Instant::now().duration_since(self.election_start)
     }
 }
 
