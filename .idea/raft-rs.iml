@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<module type="CPP_MODULE" version="4">
+  <component name="NewModuleRootManager">
+    <content url="file://$MODULE_DIR$">
+      <sourceFolder url="file://$MODULE_DIR$/raft/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/raft/examples" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/raft/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/pontoon-core/benches" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/examples" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/benches" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/client/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/pontoon-client/examples" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/pontoon-client/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/pontoon-client/benches" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/pontoon-raft/benches" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/pontoon-http/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/pontoon-server/examples" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/pontoon-server/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/pontoon-server/benches" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/api/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/pontoon-api/examples" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/pontoon-api/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/pontoon-api/benches" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/pontoon-http/examples" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/pontoon-http/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/pontoon-http/benches" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/raft/benches" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/server/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/server/examples" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/server/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/server/benches" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/client/examples" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/client/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/client/benches" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/api/examples" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/api/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/api/benches" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/pontoon-client/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/pontoon-consensus/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/pontoon-consensus/examples" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/pontoon-consensus/tests" isTestSource="true" />
+      <excludeFolder url="file://$MODULE_DIR$/api/target" />
+      <excludeFolder url="file://$MODULE_DIR$/client/target" />
+      <excludeFolder url="file://$MODULE_DIR$/pontoon-api/target" />
+      <excludeFolder url="file://$MODULE_DIR$/pontoon-client/target" />
+      <excludeFolder url="file://$MODULE_DIR$/pontoon-core/target" />
+      <excludeFolder url="file://$MODULE_DIR$/pontoon-http/target" />
+      <excludeFolder url="file://$MODULE_DIR$/pontoon-raft/target" />
+      <excludeFolder url="file://$MODULE_DIR$/pontoon-server/target" />
+      <excludeFolder url="file://$MODULE_DIR$/raft/target" />
+      <excludeFolder url="file://$MODULE_DIR$/server/target" />
+      <excludeFolder url="file://$MODULE_DIR$/target" />
+    </content>
+    <orderEntry type="inheritedJdk" />
+    <orderEntry type="sourceFolder" forTests="false" />
+    <orderEntry type="library" name="Bundled Protobuf Distribution" level="application" />
+  </component>
+</module>
