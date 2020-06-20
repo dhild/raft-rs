@@ -31,48 +31,46 @@ impl Peer {
     }
 }
 
-pub(crate) struct State<S: Storage> {
-    storage: S,
-    // state_changes: Sender<Leadership>,
-    state_thread: thread::JoinHandle<()>,
+pub struct Handles {
+    pub term_updates: Sender<usize>,
+    pub commit_updates: Sender<usize>,
 }
 
-impl<S: Storage> State<S> {
-    fn new(storage: S) -> Result<State<S>> {
-        let state_thread = thread::spawn(|| {});
+pub fn start_protocol<S, R, F>(
+    id: String,
+    peers: Vec<Peer>,
+    timeout: Duration,
+    storage: Arc<RwLock<S>>,
+    rpc: R,
+    state_machine: F,
+) -> Result<Handles>
+where
+    S: Storage,
+    R: RPC,
+    F: FnMut(usize, Vec<u8>) + Sync + Send + 'static,
+{
+    let (mut protocol, term_updates) =
+        StateProtocol::new(id, peers, timeout, storage.clone(), rpc)?;
+    let (commit_updates, commit_rx) = std::sync::mpsc::channel();
+    let current_state = Arc::new(Mutex::new(Leadership::Follower));
+    let current_state2 = current_state.clone();
 
-        Ok(State {
-            storage,
-            state_thread,
-        })
-    }
+    thread::spawn(move || {
+        protocol.run(state_machine, commit_rx, current_state2);
+    });
 
-    fn is_leader(&self) -> bool {
-        // let state = self.state.lock().expect("poisoned lock");
-        // match *state {
-        //     Leadership::Follower => false,
-        //     Leadership::Candidate => false,
-        //     Leadership::Leader => true,
-        // }
-        false
-    }
-
-    pub fn convert_to_follower(&mut self, term: usize) -> Result<()> {
-        self.storage.set_current_term(term)?;
-        self.storage.set_voted_for(None)?;
-        Ok(())
-    }
+    Ok(Handles {
+        term_updates,
+        commit_updates,
+    })
 }
 
+#[derive(Clone, Copy)]
 enum Leadership {
     Follower,
     Candidate,
     Leader,
     Shutdown,
-}
-
-fn handle_state(drop_to_follower: Receiver<()>) {
-    loop {}
 }
 
 struct StateMachine<S: Storage, F: FnMut(usize, Vec<u8>)> {
@@ -137,26 +135,88 @@ impl<S: Storage, F: FnMut(usize, Vec<u8>) + Send + 'static> StateMachine<S, F> {
     }
 }
 
-struct Follower {
+struct StateProtocol<S: Storage, R: RPC> {
+    id: String,
     timeout: Duration,
-    apply_entries: Receiver<Option<usize>>,
-    state_machine: Sender<usize>,
+    peers: Vec<Peer>,
+    storage: Arc<RwLock<S>>,
+    rpc: R,
+    commit_index: Arc<Mutex<usize>>,
+    executor: ThreadPool,
+    term_updates_tx: Sender<usize>,
+    term_updates_rx: Receiver<usize>,
 }
 
-impl Follower {
-    fn run(&mut self) -> Leadership {
+impl<S: Storage, R: RPC> StateProtocol<S, R> {
+    fn new(
+        id: String,
+        peers: Vec<Peer>,
+        timeout: Duration,
+        storage: Arc<RwLock<S>>,
+        rpc: R,
+    ) -> Result<(StateProtocol<S, R>, Sender<usize>)> {
+        let executor = ThreadPool::new()?;
+        let commit_index = Arc::new(Mutex::new(0));
+        let (term_updates_tx, term_updates_rx) = std::sync::mpsc::channel();
+        Ok((
+            StateProtocol {
+                id,
+                peers,
+                timeout,
+                storage,
+                rpc,
+                commit_index,
+                executor,
+                term_updates_tx: term_updates_tx.clone(),
+                term_updates_rx,
+            },
+            term_updates_tx,
+        ))
+    }
+
+    fn run<F: FnMut(usize, Vec<u8>) + Send + Sync + 'static>(
+        &mut self,
+        state_machine: F,
+        new_commits: Receiver<usize>,
+        current_state: Arc<Mutex<Leadership>>,
+    ) -> Result<()> {
+        let state_machine =
+            StateMachine::start(self.storage.clone(), state_machine, Arc::new(Mutex::new(0)));
+
+        loop {
+            // Grab the current state and run the appropriate protocol logic.
+            let state = { *current_state.lock().expect("poisoned lock") };
+            let state = match state {
+                Leadership::Follower => self.run_follower(&new_commits, state_machine.clone()),
+                Leadership::Candidate => self.run_candidate(),
+                Leadership::Leader => self.run_leader(state_machine.clone()),
+                Leadership::Shutdown => return Ok(()),
+            };
+            // Update the state with any changes
+            *current_state.lock().expect("poisoned lock") = state;
+        }
+    }
+
+    fn run_follower(
+        &mut self,
+        new_commits: &Receiver<usize>,
+        state_machine: Sender<usize>,
+    ) -> Leadership {
         use rand::prelude::*;
         let timeout = self.timeout.mul_f32(1.0 + rand::thread_rng().gen::<f32>());
         loop {
-            match self.apply_entries.recv_timeout(timeout) {
-                Ok(Some(index)) => {
-                    if let Err(e) = self.state_machine.send(index) {
-                        error!("State machine processing disconnected; shutting down");
-                        return Leadership::Shutdown;
+            match new_commits.recv_timeout(timeout) {
+                Ok(index) => {
+                    let mut commit_index = self.commit_index.lock().expect("poisoned lock");
+                    if index > *commit_index {
+                        if let Err(e) = state_machine.send(index) {
+                            error!("State machine processing disconnected; shutting down");
+                            return Leadership::Shutdown;
+                        }
+                        *commit_index = index;
+                    } else {
+                        trace!("Heartbeat received");
                     }
-                }
-                Ok(None) => {
-                    trace!("Heartbeat received");
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     info!("Exceeded timeout without being contacted by the leader; converting to candidate");
@@ -169,18 +229,8 @@ impl Follower {
             }
         }
     }
-}
 
-struct Candidate<S: Storage, R: RPC> {
-    id: String,
-    peers: Vec<Peer>,
-    timeout: Duration,
-    storage: Arc<RwLock<S>>,
-    rpc: R,
-}
-
-impl<S: Storage, R: RPC> Candidate<S, R> {
-    fn run(&mut self) -> Leadership {
+    fn run_candidate(&mut self) -> Leadership {
         let request = match self.init_election() {
             Ok(req) => req,
             Err(e) => {
@@ -229,12 +279,7 @@ impl<S: Storage, R: RPC> Candidate<S, R> {
         // If we end up with an outdated term, update the stored value and drop to being a follower.
         // If we don't win enough votes, remain a candidate.
         // If we win a majority of votes, promote to being the leader.
-        let majority = match self.peers.iter().filter(|p| p.voting).count() {
-            0 => 1,
-            1 | 2 => 2,
-            3 | 4 => 3,
-            x => panic!("Too many voting peers (found {})", x),
-        };
+        let majority = calculate_majority(&self.peers);
 
         let storage = self.storage.clone();
 
@@ -289,29 +334,8 @@ impl<S: Storage, R: RPC> Candidate<S, R> {
             last_log_index,
         })
     }
-}
 
-enum ElectionResult {
-    Winner,
-    NotWinner,
-    OutdatedTerm(usize),
-}
-
-struct Leader<S: Storage, R: RPC> {
-    id: String,
-    peers: Vec<Peer>,
-    majority: usize,
-    timeout: Duration,
-    storage: Arc<RwLock<S>>,
-    commit_index: Arc<Mutex<usize>>,
-    state_machine: Sender<usize>,
-    rpc: R,
-    executor: ThreadPool,
-}
-
-impl<S: Storage, R: RPC> Leader<S, R> {
-    fn run(&mut self) -> Leadership {
-        let (term_updates_tx, term_updates_rx) = std::sync::mpsc::channel();
+    fn run_leader(&mut self, state_machine: Sender<usize>) -> Leadership {
         let (index_update_tx, index_update_rx) = std::sync::mpsc::channel();
         let (log_updates_tx, log_updates_rx) = tokio::sync::watch::channel(0);
         let mut match_index = HashMap::new();
@@ -329,7 +353,7 @@ impl<S: Storage, R: RPC> Leader<S, R> {
             );
             let peer_id = peer.id.clone();
             let log_updates_rx = log_updates_rx.clone();
-            let term_updates_tx = term_updates_tx.clone();
+            let term_updates_tx = self.term_updates_tx.clone();
             match hb {
                 Ok(mut hb) => self.executor.spawn_ok(async move {
                     if let Some(newer_term) = hb.run(log_updates_rx).await {
@@ -344,7 +368,7 @@ impl<S: Storage, R: RPC> Leader<S, R> {
         }
 
         loop {
-            if let Ok(newer_term) = term_updates_rx.try_recv() {
+            if let Ok(newer_term) = self.term_updates_rx.try_recv() {
                 let mut storage = self.storage.write().expect("poisoned lock");
                 storage
                     .set_current_term(newer_term)
@@ -360,7 +384,7 @@ impl<S: Storage, R: RPC> Leader<S, R> {
                 match_index.insert(peer.id, index);
 
                 let updated = match_index.iter().filter(|(_, i)| **i >= index).count();
-                if updated >= self.majority {
+                if updated >= calculate_majority(&self.peers) {
                     let storage = self.storage.read().expect("poisoned lock");
                     match storage.current_term() {
                         Ok(current_term) => match storage.get_term(index) {
@@ -368,16 +392,16 @@ impl<S: Storage, R: RPC> Leader<S, R> {
                                 let mut commit_index =
                                     self.commit_index.lock().expect("poisoned lock");
                                 *commit_index = index;
-                                if let Err(_) = self.state_machine.send(index) {
+                                if let Err(_) = state_machine.send(index) {
                                     error!("State machine processing disconnected; shutting down");
                                     return Leadership::Shutdown;
                                 }
                             }
                             Ok(None) => {
                                 error!(
-                                        "Failed to load expected log index {} while processing commit index",
-                                        index
-                                    );
+                                    "Failed to load expected log index {} while processing commit index",
+                                    index
+                                );
                                 return Leadership::Follower;
                             }
                             Err(e) => {
@@ -395,6 +419,21 @@ impl<S: Storage, R: RPC> Leader<S, R> {
             }
         }
     }
+}
+
+fn calculate_majority(peers: &Vec<Peer>) -> usize {
+    match peers.iter().filter(|p| p.voting).count() {
+        0 => 1,
+        1 | 2 => 2,
+        3 | 4 => 3,
+        x => panic!("Too many voting peers (found {})", x),
+    }
+}
+
+enum ElectionResult {
+    Winner,
+    NotWinner,
+    OutdatedTerm(usize),
 }
 
 struct Heartbeater<S: Storage, R: RPC> {

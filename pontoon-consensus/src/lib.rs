@@ -6,5 +6,5 @@
 pub mod error;
 pub mod raft;
 pub mod rpc;
-pub mod state;
+mod state;
 pub mod storage;
