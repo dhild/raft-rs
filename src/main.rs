@@ -3,7 +3,6 @@ extern crate clap;
 extern crate env_logger;
 #[macro_use]
 extern crate log;
-extern crate raft;
 
 mod config;
 
@@ -48,7 +47,6 @@ fn main_code() -> i32 {
     }
 
     match matches.subcommand() {
-        ("serve", Some(_serve_matches)) => core::serve(cfg),
         _ => {
             error!("No subcommand matched!");
             return 2;

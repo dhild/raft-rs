@@ -3,6 +3,8 @@
 //! `pontoon_consensus` provides the core consensus module.
 //!
 
+pub mod error;
 pub mod raft;
-
-pub use raft::{Error, Raft, Result};
+pub mod rpc;
+pub mod state;
+pub mod storage;

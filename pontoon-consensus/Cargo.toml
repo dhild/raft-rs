@@ -9,7 +9,10 @@ autotests = false
 
 [dependencies]
 log = "0.4"
-futures = "0.1.29"
+futures = {version = "0.3", features = ["thread-pool"]}
+async-trait = "0.1"
+tokio = {version = "0.2", features = ["macros", "rt-core", "stream", "time"]}
+rand = "0.7"
 
 [dev-dependencies]
 env_logger = "0.7"

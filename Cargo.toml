@@ -14,12 +14,9 @@ members = [
 [dependencies]
 log = "^0"
 env_logger = "^0"
-clap = { version = "^2", features = ["yaml"], optional = true }
+clap = { version = "^2", features = ["yaml"] }
 
 [[bin]]
 name = "raft"
 path = "src/bin/raft.rs"
 required-features = ["runtime"]
-
-[features]
-runtime = ["clap"]
