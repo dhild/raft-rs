@@ -1,14 +1,16 @@
-use futures::{future::ready, FutureExt, StreamExt};
-use log::{error, info};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
+use futures::{executor::ThreadPool, future::ready, FutureExt, StreamExt};
+use log::{debug, error, info, trace};
+use std::sync::mpsc::{Receiver, RecvError, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
 
 use crate::error::Result;
-use crate::rpc::{RequestVoteRequest, RPC};
-use crate::storage::{LogCommand, Storage};
+use crate::rpc::{AppendEntriesRequest, RequestVoteRequest, RPC};
+use crate::storage::{LogCommand, LogEntry, Storage};
 use futures::stream::FuturesUnordered;
+use std::collections::HashMap;
+use std::ops::Mul;
 
 #[derive(Clone)]
 pub struct Peer {
@@ -73,27 +75,49 @@ fn handle_state(drop_to_follower: Receiver<()>) {
     loop {}
 }
 
-struct StateMachine<S: Storage> {
-    storage: S,
+struct StateMachine<S: Storage, F: FnMut(usize, Vec<u8>)> {
+    storage: Arc<RwLock<S>>,
     commits: Receiver<usize>,
-    state_machine: Sender<(usize, Vec<u8>)>,
+    state_machine: F,
     last_applied: Arc<Mutex<usize>>,
 }
 
-impl<S: Storage> StateMachine<S> {
-    fn apply(&mut self, timeout: Duration) -> std::result::Result<(), RecvTimeoutError> {
-        self.commits.recv_timeout(timeout).map(|commit_index| {
+impl<S: Storage, F: FnMut(usize, Vec<u8>) + Send + 'static> StateMachine<S, F> {
+    fn start(
+        storage: Arc<RwLock<S>>,
+        state_machine: F,
+        last_applied: Arc<Mutex<usize>>,
+    ) -> Sender<usize> {
+        let (tx, commits) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let mut sm = StateMachine {
+                storage,
+                commits,
+                state_machine,
+                last_applied,
+            };
+            sm.run();
+        });
+        tx
+    }
+
+    fn run(&mut self) {
+        while let Ok(commit_index) = self.commits.recv() {
             let mut last_applied = self.last_applied.lock().expect("poisoned lock");
             while commit_index > *last_applied {
                 let index = *last_applied + 1;
-                match self.storage.get_command(index) {
+                let cmd = {
+                    self.storage
+                        .read()
+                        .expect("poisoned lock")
+                        .get_command(index)
+                };
+                match cmd {
                     Ok(cmd) => {
                         *last_applied = index;
                         match cmd {
                             LogCommand::Command(data) => {
-                                if let Err(_) = self.state_machine.send((index, data)) {
-                                    error!("State machine channel has been closed");
-                                }
+                                (self.state_machine)(index, data);
                             }
                             LogCommand::Noop => {}
                         }
@@ -104,35 +128,44 @@ impl<S: Storage> StateMachine<S> {
                             "Failed to load command for applying to state machine: {}",
                             e
                         );
+                        // TODO: Better retry timing
                         std::thread::sleep(Duration::from_millis(10));
                     }
                 }
             }
-        })
+        }
     }
 }
 
-struct Follower<S: Storage> {
+struct Follower {
     timeout: Duration,
-    state_machine: StateMachine<S>,
+    apply_entries: Receiver<Option<usize>>,
+    state_machine: Sender<usize>,
 }
 
-impl<S: Storage> Follower<S> {
+impl Follower {
     fn run(&mut self) -> Leadership {
         use rand::prelude::*;
         let timeout = self.timeout.mul_f32(1.0 + rand::thread_rng().gen::<f32>());
-        match self.state_machine.apply(timeout) {
-            Ok(()) => {
-                // Remain a follower:
-                Leadership::Follower
-            }
-            Err(RecvTimeoutError::Timeout) => {
-                info!("Exceeded timeout without being contacted by the leader; converting to candidate");
-                Leadership::Candidate
-            }
-            Err(RecvTimeoutError::Disconnected) => {
-                info!("State processing disconnected; shutting down");
-                Leadership::Shutdown
+        loop {
+            match self.apply_entries.recv_timeout(timeout) {
+                Ok(Some(index)) => {
+                    if let Err(e) = self.state_machine.send(index) {
+                        error!("State machine processing disconnected; shutting down");
+                        return Leadership::Shutdown;
+                    }
+                }
+                Ok(None) => {
+                    trace!("Heartbeat received");
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    info!("Exceeded timeout without being contacted by the leader; converting to candidate");
+                    return Leadership::Candidate;
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    info!("Server processing disconnected; shutting down");
+                    return Leadership::Shutdown;
+                }
             }
         }
     }
@@ -262,4 +295,242 @@ enum ElectionResult {
     Winner,
     NotWinner,
     OutdatedTerm(usize),
+}
+
+struct Leader<S: Storage, R: RPC> {
+    id: String,
+    peers: Vec<Peer>,
+    majority: usize,
+    timeout: Duration,
+    storage: Arc<RwLock<S>>,
+    commit_index: Arc<Mutex<usize>>,
+    state_machine: Sender<usize>,
+    rpc: R,
+    executor: ThreadPool,
+}
+
+impl<S: Storage, R: RPC> Leader<S, R> {
+    fn run(&mut self) -> Leadership {
+        let (term_updates_tx, term_updates_rx) = std::sync::mpsc::channel();
+        let (index_update_tx, index_update_rx) = std::sync::mpsc::channel();
+        let (log_updates_tx, log_updates_rx) = tokio::sync::watch::channel(0);
+        let mut match_index = HashMap::new();
+        for peer in self.peers.iter() {
+            match_index.insert(peer.id.clone(), 0);
+
+            let hb = Heartbeater::new(
+                self.id.clone(),
+                peer.clone(),
+                self.timeout,
+                index_update_tx.clone(),
+                self.storage.clone(),
+                self.commit_index.clone(),
+                self.rpc.clone(),
+            );
+            let peer_id = peer.id.clone();
+            let log_updates_rx = log_updates_rx.clone();
+            let term_updates_tx = term_updates_tx.clone();
+            match hb {
+                Ok(mut hb) => self.executor.spawn_ok(async move {
+                    if let Some(newer_term) = hb.run(log_updates_rx).await {
+                        term_updates_tx.send(newer_term).unwrap()
+                    }
+                }),
+                Err(e) => {
+                    error!("Failed to create heartbeat for peer {}: {}", peer_id, e);
+                    return Leadership::Follower;
+                }
+            }
+        }
+
+        loop {
+            if let Ok(newer_term) = term_updates_rx.try_recv() {
+                let mut storage = self.storage.write().expect("poisoned lock");
+                storage
+                    .set_current_term(newer_term)
+                    .unwrap_or_else(|e| error!("Failed to update term to {}: {}", newer_term, e));
+                info!(
+                    "Newer term {} discovered - converting to follower",
+                    newer_term
+                );
+                return Leadership::Follower;
+            }
+
+            while let Ok((peer, index)) = index_update_rx.try_recv() {
+                match_index.insert(peer.id, index);
+
+                let updated = match_index.iter().filter(|(_, i)| **i >= index).count();
+                if updated >= self.majority {
+                    let storage = self.storage.read().expect("poisoned lock");
+                    match storage.current_term() {
+                        Ok(current_term) => match storage.get_term(index) {
+                            Ok(Some(term)) => {
+                                let mut commit_index =
+                                    self.commit_index.lock().expect("poisoned lock");
+                                *commit_index = index;
+                                if let Err(_) = self.state_machine.send(index) {
+                                    error!("State machine processing disconnected; shutting down");
+                                    return Leadership::Shutdown;
+                                }
+                            }
+                            Ok(None) => {
+                                error!(
+                                        "Failed to load expected log index {} while processing commit index",
+                                        index
+                                    );
+                                return Leadership::Follower;
+                            }
+                            Err(e) => {
+                                error!(
+                                    "Failed to load log index {} while processing commit index: {}",
+                                    index, e
+                                );
+                            }
+                        },
+                        Err(e) => {
+                            error!("Failed to get current term to process commit index: {}", e);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+struct Heartbeater<S: Storage, R: RPC> {
+    id: String,
+    peer: Peer,
+    heartbeat_interval: Duration,
+    append_entries_timeout: Duration,
+    next_index: usize,
+    match_index: Sender<(Peer, usize)>,
+    storage: Arc<RwLock<S>>,
+    commit_index: Arc<Mutex<usize>>,
+    rpc: R,
+}
+
+impl<S: Storage, R: RPC> Heartbeater<S, R> {
+    fn new(
+        id: String,
+        peer: Peer,
+        timeout: Duration,
+        match_index: Sender<(Peer, usize)>,
+        storage: Arc<RwLock<S>>,
+        commit_index: Arc<Mutex<usize>>,
+        rpc: R,
+    ) -> Result<Heartbeater<S, R>> {
+        let heartbeat_interval = timeout.mul_f32(0.3);
+        let append_entries_timeout = timeout.mul_f32(5.0);
+        let next_index = { storage.read().expect("poisoned lock").last_index()? };
+        Ok(Heartbeater {
+            id,
+            peer,
+            heartbeat_interval,
+            append_entries_timeout,
+            next_index,
+            match_index,
+            storage,
+            commit_index,
+            rpc,
+        })
+    }
+
+    async fn run(&mut self, mut updates: tokio::sync::watch::Receiver<usize>) -> Option<usize> {
+        while let Some(max_index) = tokio::time::timeout(self.heartbeat_interval, updates.recv())
+            .then(|res| match res {
+                // Heartbeat:
+                Err(_) => ready(Some(None)),
+                // Updated index:
+                Ok(Some(index)) => ready(Some(Some(index))),
+                // Nothing:
+                Ok(None) => ready(None),
+            })
+            .await
+        {
+            let (request, current_term, max_index_sent) = match self.create_request(max_index) {
+                Ok(req) => req,
+                Err(e) => {
+                    error!("Failed to get data for AppendEntries request: {}", e);
+                    continue;
+                }
+            };
+            let response = self.rpc.append_entries(self.peer.address.clone(), request);
+
+            match tokio::time::timeout(self.append_entries_timeout, response).await {
+                Ok(Ok(resp)) => {
+                    if resp.term > current_term {
+                        info!("Peer {} is on a newer term {}", self.peer.id, resp.term);
+                        return Some(resp.term);
+                    } else if !resp.success {
+                        info!(
+                            "Peer {} could not process log index {}",
+                            self.peer.id, self.next_index
+                        );
+                        if self.next_index > 1 {
+                            self.next_index -= 1;
+                        }
+                    } else {
+                        debug!("Peer {} processed AppendEntries successfully", self.peer.id);
+                        if let Some(max_index) = max_index_sent {
+                            self.next_index = max_index + 1;
+                            if let Err(_) = self.match_index.send((self.peer.clone(), max_index)) {
+                                // The leader is no longer listening for updates, we must be in a different state now
+                                return None;
+                            }
+                        }
+                    }
+                }
+                Ok(Err(e)) => {
+                    error!(
+                        "Error received from AppendEntries request to peer {}: {}",
+                        self.peer.id, e
+                    );
+                }
+                Err(_) => {
+                    error!("AppendEntries request timed out to peer {}", self.peer.id);
+                }
+            }
+        }
+        // Update channel closed; we don't know if there's a newer term.
+        None
+    }
+
+    fn create_request(
+        &mut self,
+        max_index: Option<usize>,
+    ) -> Result<(AppendEntriesRequest, usize, Option<usize>)> {
+        let leader_commit = { *self.commit_index.lock().expect("poisoned lock") };
+        let storage = self.storage.read().expect("poisoned lock");
+        let term = storage.current_term()?;
+        let prev_log_index = self.next_index - 1;
+        let prev_log_term = storage
+            .get_term(prev_log_index)?
+            .expect("log is missing entries!");
+
+        let mut entries = Vec::new();
+        if let Some(index) = max_index {
+            for index in self.next_index..(index + 1) {
+                let command = storage.get_command(index)?;
+                let term = storage.get_term(index)?.unwrap();
+                entries.push(LogEntry {
+                    index,
+                    term,
+                    command,
+                });
+            }
+        }
+        let max_sent_index = entries.iter().last().map(|l| l.index);
+        Ok((
+            AppendEntriesRequest {
+                leader_id: self.id.clone(),
+                term,
+                leader_commit,
+                prev_log_index,
+                prev_log_term,
+                entries,
+            },
+            term,
+            max_sent_index,
+        ))
+    }
 }

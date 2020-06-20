@@ -11,7 +11,7 @@ autotests = false
 log = "0.4"
 futures = {version = "0.3", features = ["thread-pool"]}
 async-trait = "0.1"
-tokio = {version = "0.2", features = ["macros", "rt-core", "stream", "time"]}
+tokio = {version = "0.2", features = ["sync", "time"]}
 rand = "0.7"
 
 [dev-dependencies]

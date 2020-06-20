@@ -11,7 +11,7 @@ pub enum LogCommand {
     Noop,
 }
 
-pub trait Storage: Clone + Send + 'static {
+pub trait Storage: Clone + Send + Sync + 'static {
     fn current_term(&self) -> Result<usize>;
     fn set_current_term(&mut self, current_term: usize) -> Result<()>;
     fn voted_for(&self) -> Result<Option<String>>;
