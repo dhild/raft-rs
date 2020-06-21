@@ -4,7 +4,6 @@
 //!
 
 pub mod error;
-pub mod raft;
+mod protocol;
 pub mod rpc;
-mod state;
 pub mod storage;

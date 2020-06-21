@@ -1,10 +1,9 @@
 use async_trait::async_trait;
-use log::{debug, error};
-use std::sync::{Arc, Mutex, RwLock};
+use log::debug;
+use std::sync::{Arc, RwLock};
 
 use crate::error::Result;
 use crate::storage::{LogEntry, Storage};
-use std::sync::mpsc::Sender;
 
 pub struct AppendEntriesRequest {
     pub leader_id: String,
@@ -80,20 +79,34 @@ pub trait RPC: Clone + Send + 'static {
 
 pub struct RaftServer<S: Storage> {
     storage: Arc<RwLock<S>>,
-    term_updates: Sender<usize>,
-    commit_updates: Sender<usize>,
+    term_updates: Box<dyn FnMut(usize)>,
+    commit_updates: Box<dyn FnMut(usize)>,
 }
 
 impl<S: Storage> RaftServer<S> {
+    pub(crate) fn new<T, C>(
+        storage: &Arc<RwLock<S>>,
+        term_updates: T,
+        commit_updates: C,
+    ) -> RaftServer<S>
+    where
+        T: FnMut(usize) + 'static,
+        C: FnMut(usize) + 'static,
+    {
+        RaftServer {
+            storage: storage.clone(),
+            term_updates: Box::new(term_updates),
+            commit_updates: Box::new(commit_updates),
+        }
+    }
+
     pub fn append_entries(&mut self, req: AppendEntriesRequest) -> Result<AppendEntriesResponse> {
         let mut storage = self.storage.write().expect("poisoned lock");
 
         let current_term = storage.current_term()?;
         // Ensure we are on the latest term
         if req.term > current_term {
-            self.term_updates
-                .send(req.term)
-                .unwrap_or_else(|_| error!("Processing AppendEntries after protocol has stopped"));
+            (self.term_updates)(req.term);
             storage.set_current_term(req.term)?;
             return Ok(AppendEntriesResponse::failed(current_term));
         }
@@ -128,9 +141,7 @@ impl<S: Storage> RaftServer<S> {
         }
 
         // Update the commit index with the latest committed value in our logs
-        self.commit_updates
-            .send(req.leader_commit.min(index))
-            .unwrap_or_else(|_| error!("Processing AppendEntries after protocol has stopped"));
+        (self.commit_updates)(req.leader_commit.min(index));
 
         Ok(AppendEntriesResponse::success(current_term))
     }
@@ -142,9 +153,7 @@ impl<S: Storage> RaftServer<S> {
         let current_term = {
             let current_term = storage.current_term()?;
             if req.term > current_term {
-                self.term_updates.send(req.term).unwrap_or_else(|_| {
-                    error!("Processing AppendEntries after protocol has stopped")
-                });
+                (self.term_updates)(req.term);
                 storage.set_current_term(req.term)?;
                 req.term
             } else {

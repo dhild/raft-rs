@@ -1,16 +1,15 @@
+use futures::stream::FuturesUnordered;
 use futures::{executor::ThreadPool, future::ready, FutureExt, StreamExt};
-use log::{debug, error, info, trace};
-use std::sync::mpsc::{Receiver, RecvError, RecvTimeoutError, Sender, TryRecvError};
+use log::{debug, error, info, trace, warn};
+use std::collections::HashMap;
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
 
-use crate::error::Result;
-use crate::rpc::{AppendEntriesRequest, RequestVoteRequest, RPC};
+use crate::error::{Error, Result};
+use crate::rpc::{AppendEntriesRequest, RaftServer, RequestVoteRequest, RPC};
 use crate::storage::{LogCommand, LogEntry, Storage};
-use futures::stream::FuturesUnordered;
-use std::collections::HashMap;
-use std::ops::Mul;
 
 #[derive(Clone)]
 pub struct Peer {
@@ -31,72 +30,119 @@ impl Peer {
     }
 }
 
-pub struct Handles {
-    pub term_updates: Sender<usize>,
-    pub commit_updates: Sender<usize>,
-}
-
-pub fn start_protocol<S, R, F>(
+pub fn start<S, R, F>(
     id: String,
     peers: Vec<Peer>,
     timeout: Duration,
     storage: Arc<RwLock<S>>,
     rpc: R,
     state_machine: F,
-) -> Result<Handles>
+) -> Result<(RaftServer<S>, Consensus<S>)>
 where
     S: Storage,
     R: RPC,
     F: FnMut(usize, Vec<u8>) + Sync + Send + 'static,
 {
-    let (mut protocol, term_updates) =
-        StateProtocol::new(id, peers, timeout, storage.clone(), rpc)?;
-    let (commit_updates, commit_rx) = std::sync::mpsc::channel();
-    let current_state = Arc::new(Mutex::new(Leadership::Follower));
-    let current_state2 = current_state.clone();
+    let (commit_updates, last_applied_rx) = LogCommitter::start(&storage, state_machine);
 
-    thread::spawn(move || {
-        protocol.run(state_machine, commit_rx, current_state2);
-    });
+    let (current_state, new_logs_tx, term_updates_tx) =
+        ProtocolTasks::start(id, peers, timeout, &storage, rpc, commit_updates)?;
 
-    Ok(Handles {
-        term_updates,
-        commit_updates,
-    })
+    let consensus_new_logs_tx = new_logs_tx.clone();
+
+    let raft_server = crate::rpc::RaftServer::new(
+        &storage,
+        move |term| {
+            if let Err(_) = term_updates_tx.send(term) {
+                warn!("Raft protocol has terminated");
+            }
+        },
+        move |commit| {
+            if let Err(_) = new_logs_tx.send(commit) {
+                warn!("Raft protocol has terminated");
+            }
+        },
+    );
+
+    let consensus = Consensus {
+        storage,
+        current_state,
+        log_updates: consensus_new_logs_tx,
+        last_applied_rx,
+    };
+
+    Ok((raft_server, consensus))
+}
+
+pub struct Consensus<S: Storage> {
+    storage: Arc<RwLock<S>>,
+    current_state: Arc<Mutex<ProtocolState>>,
+    log_updates: Sender<usize>,
+    last_applied_rx: Receiver<usize>,
+}
+
+impl<S: Storage> Consensus<S> {
+    pub fn commit_command(&mut self, cmd: &[u8]) -> Result<()> {
+        if let ProtocolState::Leader = *self.current_state.lock().expect("poisoned lock") {
+            return Err(Error::NotLeader.into());
+        }
+
+        let index = {
+            let mut storage = self.storage.write().expect("poisoned lock");
+
+            let term = storage.current_term()?;
+            let command = LogCommand::Command(cmd.into());
+
+            storage.append_entry(term, command)?
+        };
+
+        self.log_updates
+            .send(index)
+            .map_err(|_| Error::RaftProtocolTerminated)?;
+
+        while self
+            .last_applied_rx
+            .recv()
+            .map_err(|_| Error::RaftProtocolTerminated)?
+            < index
+        {}
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy)]
-enum Leadership {
+enum ProtocolState {
     Follower,
     Candidate,
     Leader,
     Shutdown,
 }
 
-struct StateMachine<S: Storage, F: FnMut(usize, Vec<u8>)> {
+pub struct LogCommitter<S: Storage, F: FnMut(usize, Vec<u8>)> {
     storage: Arc<RwLock<S>>,
     commits: Receiver<usize>,
     state_machine: F,
     last_applied: Arc<Mutex<usize>>,
+    last_applied_tx: Sender<usize>,
 }
 
-impl<S: Storage, F: FnMut(usize, Vec<u8>) + Send + 'static> StateMachine<S, F> {
-    fn start(
-        storage: Arc<RwLock<S>>,
-        state_machine: F,
-        last_applied: Arc<Mutex<usize>>,
-    ) -> Sender<usize> {
-        let (tx, commits) = std::sync::mpsc::channel();
+impl<S: Storage, F: FnMut(usize, Vec<u8>) + Send + 'static> LogCommitter<S, F> {
+    fn start(storage: &Arc<RwLock<S>>, state_machine: F) -> (Sender<usize>, Receiver<usize>) {
+        let storage = storage.clone();
+        let last_applied = Arc::new(Mutex::new(0));
+        let (incoming_commits, commits) = std::sync::mpsc::channel();
+        let (last_applied_tx, last_applied_rx) = std::sync::mpsc::channel();
         thread::spawn(move || {
-            let mut sm = StateMachine {
+            let mut sm = LogCommitter {
                 storage,
                 commits,
                 state_machine,
                 last_applied,
+                last_applied_tx,
             };
             sm.run();
         });
-        tx
+        (incoming_commits, last_applied_rx)
     }
 
     fn run(&mut self) {
@@ -119,7 +165,10 @@ impl<S: Storage, F: FnMut(usize, Vec<u8>) + Send + 'static> StateMachine<S, F> {
                             }
                             LogCommand::Noop => {}
                         }
-                        *last_applied = index;
+                        if let Err(_) = self.last_applied_tx.send(index) {
+                            trace!("consensus struct has been dropped; closing log committer");
+                            return;
+                        }
                     }
                     Err(e) => {
                         error!(
@@ -135,107 +184,118 @@ impl<S: Storage, F: FnMut(usize, Vec<u8>) + Send + 'static> StateMachine<S, F> {
     }
 }
 
-struct StateProtocol<S: Storage, R: RPC> {
+pub struct ProtocolTasks<S: Storage, R: RPC> {
     id: String,
     timeout: Duration,
     peers: Vec<Peer>,
     storage: Arc<RwLock<S>>,
     rpc: R,
     commit_index: Arc<Mutex<usize>>,
+    current_state: Arc<Mutex<ProtocolState>>,
     executor: ThreadPool,
     term_updates_tx: Sender<usize>,
     term_updates_rx: Receiver<usize>,
+    commit_updates_tx: Sender<usize>,
+    new_logs_rx: tokio::sync::watch::Receiver<usize>,
 }
 
-impl<S: Storage, R: RPC> StateProtocol<S, R> {
-    fn new(
+impl<S: Storage, R: RPC> ProtocolTasks<S, R> {
+    fn start(
         id: String,
         peers: Vec<Peer>,
         timeout: Duration,
-        storage: Arc<RwLock<S>>,
+        storage: &Arc<RwLock<S>>,
         rpc: R,
-    ) -> Result<(StateProtocol<S, R>, Sender<usize>)> {
-        let executor = ThreadPool::new()?;
-        let commit_index = Arc::new(Mutex::new(0));
+        commit_updates_tx: Sender<usize>,
+    ) -> Result<(Arc<Mutex<ProtocolState>>, Sender<usize>, Sender<usize>)> {
         let (term_updates_tx, term_updates_rx) = std::sync::mpsc::channel();
-        Ok((
-            StateProtocol {
-                id,
-                peers,
-                timeout,
-                storage,
-                rpc,
-                commit_index,
-                executor,
-                term_updates_tx: term_updates_tx.clone(),
-                term_updates_rx,
-            },
-            term_updates_tx,
-        ))
+        let current_state = Arc::new(Mutex::new(ProtocolState::Follower));
+        let commit_index = Arc::new(Mutex::new(0));
+        let executor = ThreadPool::new()?;
+
+        let (new_logs_tx, new_logs_rx) = std::sync::mpsc::channel();
+        let (new_logs_multi_tx, new_logs_multi_rx) = tokio::sync::watch::channel(1);
+        std::thread::spawn(move || {
+            // Errors from either sending or receiving should terminate this thread
+            while let Ok(index) = new_logs_rx.recv() {
+                if new_logs_multi_tx.broadcast(index).is_err() {
+                    return;
+                }
+            }
+        });
+
+        let mut protocol = ProtocolTasks {
+            id,
+            peers,
+            timeout,
+            storage: storage.clone(),
+            rpc,
+            commit_index,
+            current_state: current_state.clone(),
+            executor,
+            term_updates_tx: term_updates_tx.clone(),
+            term_updates_rx,
+            commit_updates_tx,
+            new_logs_rx: new_logs_multi_rx,
+        };
+        thread::spawn(move || {
+            protocol.run();
+        });
+        Ok((current_state, new_logs_tx, term_updates_tx))
     }
 
-    fn run<F: FnMut(usize, Vec<u8>) + Send + Sync + 'static>(
-        &mut self,
-        state_machine: F,
-        new_commits: Receiver<usize>,
-        current_state: Arc<Mutex<Leadership>>,
-    ) -> Result<()> {
-        let state_machine =
-            StateMachine::start(self.storage.clone(), state_machine, Arc::new(Mutex::new(0)));
-
+    fn run(&mut self) {
         loop {
             // Grab the current state and run the appropriate protocol logic.
-            let state = { *current_state.lock().expect("poisoned lock") };
+            let state = { *self.current_state.lock().expect("poisoned lock") };
             let state = match state {
-                Leadership::Follower => self.run_follower(&new_commits, state_machine.clone()),
-                Leadership::Candidate => self.run_candidate(),
-                Leadership::Leader => self.run_leader(state_machine.clone()),
-                Leadership::Shutdown => return Ok(()),
+                ProtocolState::Follower => self.run_follower(),
+                ProtocolState::Candidate => self.run_candidate(),
+                ProtocolState::Leader => self.run_leader(),
+                ProtocolState::Shutdown => return,
             };
             // Update the state with any changes
-            *current_state.lock().expect("poisoned lock") = state;
+            *self.current_state.lock().expect("poisoned lock") = state;
         }
     }
 
-    fn run_follower(
-        &mut self,
-        new_commits: &Receiver<usize>,
-        state_machine: Sender<usize>,
-    ) -> Leadership {
+    fn run_follower(&mut self) -> ProtocolState {
         use rand::prelude::*;
         let timeout = self.timeout.mul_f32(1.0 + rand::thread_rng().gen::<f32>());
+
         loop {
-            match new_commits.recv_timeout(timeout) {
-                Ok(index) => {
+            let update = tokio::time::timeout(timeout, self.new_logs_rx.recv());
+            match futures::executor::block_on(async move { update.await }) {
+                Ok(Some(index)) => {
                     let mut commit_index = self.commit_index.lock().expect("poisoned lock");
                     if index > *commit_index {
-                        if let Err(e) = state_machine.send(index) {
-                            error!("State machine processing disconnected; shutting down");
-                            return Leadership::Shutdown;
-                        }
                         *commit_index = index;
+                        if let Err(_) = self.commit_updates_tx.send(index) {
+                            error!("State machine processing disconnected; shutting down");
+                            return ProtocolState::Shutdown;
+                        }
                     } else {
                         trace!("Heartbeat received");
                     }
                 }
-                Err(RecvTimeoutError::Timeout) => {
-                    info!("Exceeded timeout without being contacted by the leader; converting to candidate");
-                    return Leadership::Candidate;
-                }
-                Err(RecvTimeoutError::Disconnected) => {
+                Ok(None) => {
                     info!("Server processing disconnected; shutting down");
-                    return Leadership::Shutdown;
+                    return ProtocolState::Shutdown;
+                }
+                Err(_) => {
+                    info!("Exceeded timeout without being contacted by the leader; converting to candidate");
+                    return ProtocolState::Candidate;
                 }
             }
         }
     }
 
-    fn run_candidate(&mut self) -> Leadership {
+    fn run_candidate(&mut self) -> ProtocolState {
         let request = match self.init_election() {
             Ok(req) => req,
             Err(e) => {
                 error!("Failed to initialize election: {}", e);
-                return Leadership::Follower;
+                return ProtocolState::Follower;
             }
         };
         // Send out the RequestVote RPC calls. Use a timeout on each of them, so that we will
@@ -304,11 +364,11 @@ impl<S: Storage, R: RPC> StateProtocol<S, R> {
                             .set_voted_for(None)
                             .unwrap_or_else(|e| error!("Could not clear vote: {}", e));
                     }
-                    Leadership::Follower
+                    ProtocolState::Follower
                 } else if votes >= majority {
-                    Leadership::Leader
+                    ProtocolState::Leader
                 } else {
-                    Leadership::Candidate
+                    ProtocolState::Candidate
                 }
             });
 
@@ -335,9 +395,8 @@ impl<S: Storage, R: RPC> StateProtocol<S, R> {
         })
     }
 
-    fn run_leader(&mut self, state_machine: Sender<usize>) -> Leadership {
+    fn run_leader(&mut self) -> ProtocolState {
         let (index_update_tx, index_update_rx) = std::sync::mpsc::channel();
-        let (log_updates_tx, log_updates_rx) = tokio::sync::watch::channel(0);
         let mut match_index = HashMap::new();
         for peer in self.peers.iter() {
             match_index.insert(peer.id.clone(), 0);
@@ -352,7 +411,7 @@ impl<S: Storage, R: RPC> StateProtocol<S, R> {
                 self.rpc.clone(),
             );
             let peer_id = peer.id.clone();
-            let log_updates_rx = log_updates_rx.clone();
+            let log_updates_rx = self.new_logs_rx.clone();
             let term_updates_tx = self.term_updates_tx.clone();
             match hb {
                 Ok(mut hb) => self.executor.spawn_ok(async move {
@@ -362,7 +421,7 @@ impl<S: Storage, R: RPC> StateProtocol<S, R> {
                 }),
                 Err(e) => {
                     error!("Failed to create heartbeat for peer {}: {}", peer_id, e);
-                    return Leadership::Follower;
+                    return ProtocolState::Follower;
                 }
             }
         }
@@ -377,7 +436,7 @@ impl<S: Storage, R: RPC> StateProtocol<S, R> {
                     "Newer term {} discovered - converting to follower",
                     newer_term
                 );
-                return Leadership::Follower;
+                return ProtocolState::Follower;
             }
 
             while let Ok((peer, index)) = index_update_rx.try_recv() {
@@ -387,30 +446,34 @@ impl<S: Storage, R: RPC> StateProtocol<S, R> {
                 if updated >= calculate_majority(&self.peers) {
                     let storage = self.storage.read().expect("poisoned lock");
                     match storage.current_term() {
-                        Ok(current_term) => match storage.get_term(index) {
-                            Ok(Some(term)) => {
-                                let mut commit_index =
-                                    self.commit_index.lock().expect("poisoned lock");
-                                *commit_index = index;
-                                if let Err(_) = state_machine.send(index) {
-                                    error!("State machine processing disconnected; shutting down");
-                                    return Leadership::Shutdown;
+                        Ok(current_term) => {
+                            match storage.get_term(index) {
+                                Ok(Some(term)) => {
+                                    if current_term == term {
+                                        let mut commit_index =
+                                            self.commit_index.lock().expect("poisoned lock");
+                                        *commit_index = index;
+                                        if let Err(_) = self.commit_updates_tx.send(index) {
+                                            error!("State machine processing disconnected; shutting down");
+                                            return ProtocolState::Shutdown;
+                                        }
+                                    }
                                 }
-                            }
-                            Ok(None) => {
-                                error!(
+                                Ok(None) => {
+                                    error!(
                                     "Failed to load expected log index {} while processing commit index",
                                     index
                                 );
-                                return Leadership::Follower;
-                            }
-                            Err(e) => {
-                                error!(
+                                    return ProtocolState::Follower;
+                                }
+                                Err(e) => {
+                                    error!(
                                     "Failed to load log index {} while processing commit index: {}",
                                     index, e
                                 );
+                                }
                             }
-                        },
+                        }
                         Err(e) => {
                             error!("Failed to get current term to process commit index: {}", e);
                         }
