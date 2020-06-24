@@ -2,7 +2,7 @@ use futures::stream::FuturesUnordered;
 use futures::{executor::ThreadPool, future::ready, FutureExt, StreamExt};
 use log::{debug, error, info, trace, warn};
 use std::collections::HashMap;
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
@@ -264,9 +264,16 @@ impl<S: Storage, R: RPC> ProtocolTasks<S, R> {
         let timeout = self.timeout.mul_f32(1.0 + rand::thread_rng().gen::<f32>());
 
         loop {
-            let update = tokio::time::timeout(timeout, self.new_logs_rx.recv());
-            match futures::executor::block_on(async move { update.await }) {
-                Ok(Some(index)) => {
+            if let Ok(newer_term) = self.term_updates_rx.try_recv() {
+                let mut storage = self.storage.write().expect("poisoned lock");
+                storage
+                    .set_current_term(newer_term)
+                    .unwrap_or_else(|e| error!("Failed to update term to {}: {}", newer_term, e));
+                info!("Newer term {} discovered", newer_term);
+            }
+
+            match self.append_entries_rx.recv_timeout(timeout) {
+                Ok(index) => {
                     let mut commit_index = self.commit_index.lock().expect("poisoned lock");
                     if index > *commit_index {
                         *commit_index = index;
@@ -278,11 +285,11 @@ impl<S: Storage, R: RPC> ProtocolTasks<S, R> {
                         trace!("Heartbeat received");
                     }
                 }
-                Ok(None) => {
-                    info!("Server processing disconnected; shutting down");
+                Err(RecvTimeoutError::Disconnected) => {
+                    info!("RPC server dropped; shutting down");
                     return ProtocolState::Shutdown;
                 }
-                Err(_) => {
+                Err(RecvTimeoutError::Timeout) => {
                     info!("Exceeded timeout without being contacted by the leader; converting to candidate");
                     return ProtocolState::Candidate;
                 }
