@@ -1,6 +1,8 @@
 use async_trait::async_trait;
+use futures::lock::Mutex;
 use log::debug;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use tokio::sync::mpsc::Sender;
 
 use crate::error::Result;
 use crate::storage::{LogEntry, Storage};
@@ -78,35 +80,34 @@ pub trait RPC: Clone + Send + 'static {
 }
 
 pub struct RaftServer<S: Storage> {
-    storage: Arc<RwLock<S>>,
-    term_updates: Box<dyn FnMut(usize)>,
-    commit_updates: Box<dyn FnMut(usize)>,
+    storage: Arc<Mutex<S>>,
+    term_updates: Sender<usize>,
+    commit_updates: Sender<usize>,
 }
 
 impl<S: Storage> RaftServer<S> {
-    pub(crate) fn new<T, C>(
-        storage: &Arc<RwLock<S>>,
-        term_updates: T,
-        commit_updates: C,
-    ) -> RaftServer<S>
-    where
-        T: FnMut(usize) + 'static,
-        C: FnMut(usize) + 'static,
-    {
+    pub(crate) fn new(
+        storage: Arc<Mutex<S>>,
+        term_updates: Sender<usize>,
+        commit_updates: Sender<usize>,
+    ) -> RaftServer<S> {
         RaftServer {
-            storage: storage.clone(),
-            term_updates: Box::new(term_updates),
-            commit_updates: Box::new(commit_updates),
+            storage,
+            term_updates,
+            commit_updates,
         }
     }
 
-    pub fn append_entries(&mut self, req: AppendEntriesRequest) -> Result<AppendEntriesResponse> {
-        let mut storage = self.storage.write().expect("poisoned lock");
+    pub async fn append_entries(
+        &mut self,
+        req: AppendEntriesRequest,
+    ) -> Result<AppendEntriesResponse> {
+        let mut storage = self.storage.lock().await;
 
         let current_term = storage.current_term()?;
         // Ensure we are on the latest term
         if req.term > current_term {
-            (self.term_updates)(req.term);
+            self.term_updates.send(req.term).await?;
             storage.set_current_term(req.term)?;
             return Ok(AppendEntriesResponse::failed(current_term));
         }
@@ -141,19 +142,21 @@ impl<S: Storage> RaftServer<S> {
         }
 
         // Update the commit index with the latest committed value in our logs
-        (self.commit_updates)(req.leader_commit.min(index));
+        self.commit_updates
+            .send(req.leader_commit.min(index))
+            .await?;
 
         Ok(AppendEntriesResponse::success(current_term))
     }
 
-    pub fn request_vote(&mut self, req: RequestVoteRequest) -> Result<RequestVoteResponse> {
-        let mut storage = self.storage.write().expect("poisoned lock");
+    pub async fn request_vote(&mut self, req: RequestVoteRequest) -> Result<RequestVoteResponse> {
+        let mut storage = self.storage.lock().await;
 
         // Ensure we are on the latest term - if we are not, update and continue processing the request.
         let current_term = {
             let current_term = storage.current_term()?;
             if req.term > current_term {
-                (self.term_updates)(req.term);
+                self.term_updates.send(req.term).await?;
                 storage.set_current_term(req.term)?;
                 req.term
             } else {
