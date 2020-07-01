@@ -7,9 +7,10 @@ edition = "2018"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [features]
-default = ["memory-storage", "http-rpc"]
+default = ["memory-storage", "kv-store", "http-rpc"]
 memory-storage = []
 http-rpc = ["hyper", "serde_json"]
+kv-store = ["serde_json"]
 
 [dependencies]
 log = "0.4"
