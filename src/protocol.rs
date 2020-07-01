@@ -1,25 +1,21 @@
-use async_trait::async_trait;
-use futures::lock::Mutex;
-use futures::stream::FuturesUnordered;
-use futures::{future::ready, join, FutureExt};
-use log::{debug, error, info, trace, warn};
-use std::collections::HashMap;
-use std::future::Future;
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::select;
-use tokio::sync::mpsc::{channel, Receiver, Sender};
-
 use crate::error::{Error, Result};
 use crate::rpc::{AppendEntriesRequest, RaftServer, RequestVoteRequest, RPC};
-use crate::storage::{LogCommand, LogEntry, Storage};
+use crate::state::{StateMachine, StateMachineApplier};
+use crate::storage::{Command, LogCommand, LogEntry, Storage};
+use async_channel::{Receiver, Sender, TrySendError};
+use async_lock::Lock;
+use futures::executor::ThreadPool;
+use futures::prelude::*;
+use futures::{select, TryFutureExt};
+use log::{debug, error, info, trace};
+use std::collections::HashMap;
+use std::time::Duration;
 
 #[derive(Clone)]
 pub struct Peer {
     id: String,
     address: String,
     voting: bool,
-    leader: bool,
 }
 
 impl Peer {
@@ -28,41 +24,31 @@ impl Peer {
             id,
             address,
             voting: true,
-            leader: false,
         }
     }
 }
 
-#[async_trait]
-pub trait StateMachine {
-    async fn apply(&self, index: usize, command: &[u8]) -> Result<()>;
-}
-
-pub fn start<S, R, F>(
+pub fn start<C, S, R, M>(
     id: String,
     peers: Vec<Peer>,
     timeout: Duration,
     storage: S,
     rpc: R,
-    state_machine: F,
-) -> Result<(
-    impl Future<Output = Result<()>>,
-    RaftServer<S>,
-    Consensus<S>,
-)>
+) -> Result<M>
 where
-    S: Storage,
-    R: RPC,
-    F: StateMachine,
+    C: Command,
+    S: Storage<C>,
+    R: RPC<C>,
+    M: StateMachine,
 {
-    let storage = Arc::new(Mutex::new(storage));
-    let (commits_protocol_tx, commits_rx) = channel(1);
-    let (commits_tx, commits_protocol_rx) = channel(1);
-    let (last_applied_tx, last_applied_rx) = channel(1);
-    let (term_updates_tx, term_updates_rx) = channel(1);
-    let (new_logs_tx, new_logs_rx) = channel(1);
+    let storage = Lock::new(Box::new(storage));
+    let (commits_protocol_tx, commits_to_apply_rx) = async_channel::bounded(1);
+    let (commits_tx, commits_protocol_rx) = async_channel::bounded(1);
+    let (last_applied_tx, last_applied_rx) = async_channel::bounded(1);
+    let (term_updates_tx, term_updates_rx) = async_channel::bounded(1);
+    let (new_logs_tx, new_logs_rx) = async_channel::bounded(1);
 
-    let mut lc = LogCommitter::new(storage.clone(), state_machine, commits_rx, last_applied_tx);
+    let executor = ThreadPool::new()?;
 
     let mut tasks = ProtocolTasks::start(
         id,
@@ -75,58 +61,71 @@ where
         commits_protocol_tx,
         commits_protocol_rx,
         new_logs_rx,
+        executor.clone(),
     )?;
-
-    let raft_server = crate::rpc::RaftServer::new(storage.clone(), term_updates_tx, commits_tx);
 
     let consensus = Consensus {
         storage,
         current_state: tasks.current_state.clone(),
-        log_updates: new_logs_tx,
+        new_commands_tx: new_logs_tx,
         last_applied_rx,
+        executor: executor.clone(),
     };
 
-    let fut = async move {
-        join!(lc.run(), tasks.run());
-        Ok(())
-    };
+    let (state_machine, applier) = M::build(consensus);
 
-    Ok((fut, raft_server, consensus))
+    executor.spawn_ok(async move {
+        let mut lc = LogCommitter::new(applier, commits_to_apply_rx, last_applied_tx);
+        lc.run().await
+    });
+    executor.spawn_ok(async move { tasks.run().await });
+
+    let raft_server = RaftServer::new(storage.clone(), term_updates_tx, commits_tx);
+
+    Ok(state_machine)
 }
 
-pub struct Consensus<S: Storage> {
-    storage: Arc<Mutex<S>>,
-    current_state: Arc<Mutex<ProtocolState>>,
-    log_updates: Sender<usize>,
+pub struct Consensus<C: Command> {
+    storage: Lock<Box<dyn Storage<C>>>,
+    current_state: Lock<ProtocolState>,
+    new_commands_tx: Sender<(usize, LogCommand<C>)>,
     last_applied_rx: Receiver<usize>,
+    executor: ThreadPool,
 }
 
-impl<S: Storage> Consensus<S> {
-    pub async fn commit_command(&mut self, cmd: &[u8]) -> Result<()> {
-        if let ProtocolState::Leader = *self.current_state.lock().await {
+impl<C: 'static + Command> Consensus<C> {
+    pub async fn commit(&mut self, cmd: C) -> Result<usize> {
+        let index = self.send(cmd).await?;
+
+        while let Ok(last_applied) = self.last_applied_rx.recv().await {
+            if last_applied >= index {
+                return Ok(index);
+            }
+        }
+        Err(Error::RaftProtocolTerminated.into())
+    }
+
+    pub async fn send(&mut self, cmd: C) -> Result<usize> {
+        let current_state = self.current_state.lock().await;
+        if let ProtocolState::Leader = *current_state {
             return Err(Error::NotLeader.into());
         }
+        let command = LogCommand::Command(cmd.into());
 
         let index = {
             let mut storage = self.storage.lock().await;
 
             let term = storage.current_term()?;
-            let command = LogCommand::Command(cmd.into());
 
-            storage.append_entry(term, command)?
+            storage.append_entry(term, command.clone())?
         };
 
-        self.log_updates
-            .send(index)
+        self.new_commands_tx
+            .send((index, command))
             .await
             .map_err(|_| Error::RaftProtocolTerminated)?;
 
-        while let Some(last_applied) = self.last_applied_rx.recv().await {
-            if last_applied >= index {
-                return Ok(());
-            }
-        }
-        Err(Error::RaftProtocolTerminated.into())
+        Ok(index)
     }
 }
 
@@ -138,101 +137,81 @@ enum ProtocolState {
     Shutdown,
 }
 
-pub struct LogCommitter<S: Storage, F: StateMachine> {
-    storage: Arc<Mutex<S>>,
-    commits: Receiver<usize>,
-    state_machine: F,
-    last_applied: Arc<Mutex<usize>>,
+pub struct LogCommitter<SM: StateMachineApplier> {
+    commits: Receiver<(usize, LogCommand<SM::Command>)>,
+    state_machine: SM,
     last_applied_tx: Sender<usize>,
 }
 
-impl<S: Storage, F: StateMachine> LogCommitter<S, F> {
+impl<SM: StateMachineApplier> LogCommitter<SM> {
     fn new(
-        storage: Arc<Mutex<S>>,
-        state_machine: F,
-        commits: Receiver<usize>,
+        state_machine: SM,
+        commits: Receiver<(usize, LogCommand<SM::Command>)>,
         last_applied_tx: Sender<usize>,
-    ) -> LogCommitter<S, F> {
-        let last_applied = Arc::new(Mutex::new(0));
+    ) -> LogCommitter<SM> {
         LogCommitter {
-            storage,
             commits,
             state_machine,
-            last_applied,
             last_applied_tx,
         }
     }
 
     async fn run(&mut self) {
-        while let Some(commit_index) = self.commits.recv().await {
-            let mut last_applied = self.last_applied.lock().await;
-            while commit_index > *last_applied {
-                let index = *last_applied + 1;
-                let cmd = { self.storage.lock().await.get_command(index) };
-                match cmd {
-                    Ok(cmd) => {
-                        *last_applied = index;
-                        match cmd {
-                            LogCommand::Command(data) => {
-                                if let Err(e) = self.state_machine.apply(index, &data).await {
-                                    error!(
-                                        "Failed to apply index {} to state machine: {}",
-                                        index, e
-                                    );
-                                    return;
-                                }
-                            }
-                            LogCommand::Noop => {}
-                        }
-                        if let Err(_) = self.last_applied_tx.send(index).await {
-                            trace!("consensus struct has been dropped; closing log committer");
-                            return;
-                        }
-                    }
-                    Err(e) => {
-                        error!(
-                            "Failed to load command for applying to state machine: {}",
-                            e
-                        );
-                        // TODO: Better retry timing
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                }
+        let mut last_applied = 0;
+        while let Ok((commit_index, cmd)) = self.commits.recv().await {
+            if commit_index != (last_applied + 1) {
+                error!(
+                    "Out of order commit transmission, expected {} and got {}",
+                    (last_applied + 1),
+                    commit_index
+                );
+                panic!()
+            }
+            last_applied = commit_index;
+            match cmd {
+                LogCommand::Command(data) => self.state_machine.apply(commit_index, data).await,
+                LogCommand::Noop => {}
+            }
+            if let Err(_) = self.last_applied_tx.send(commit_index).await {
+                trace!("consensus struct has been dropped; closing log committer");
+                return;
             }
         }
     }
 }
 
-pub struct ProtocolTasks<S: Storage, R: RPC> {
+pub struct ProtocolTasks<C: Command, R: RPC<C>> {
     id: String,
     timeout: Duration,
     peers: Vec<Peer>,
-    storage: Arc<Mutex<S>>,
+    storage: Lock<Box<dyn Storage<C>>>,
     rpc: R,
-    commit_index: Arc<Mutex<usize>>,
-    current_state: Arc<Mutex<ProtocolState>>,
+    commit_index: Lock<usize>,
+    current_state: Lock<ProtocolState>,
     term_updates_tx: Sender<usize>,
     term_updates_rx: Receiver<usize>,
-    commits_rx: Receiver<usize>,
-    commits_tx: Sender<usize>,
+    append_entries_rx: Receiver<usize>,
+    commits_to_apply_tx: Sender<(usize, LogCommand<C>)>,
     new_logs_rx: Receiver<usize>,
+    executor: ThreadPool,
 }
 
-impl<S: Storage, R: RPC> ProtocolTasks<S, R> {
+impl<C: Command + 'static, R: RPC<C>> ProtocolTasks<C, R> {
     fn start(
         id: String,
         peers: Vec<Peer>,
         timeout: Duration,
-        storage: Arc<Mutex<S>>,
+        storage: Lock<Box<dyn Storage<C>>>,
         rpc: R,
         term_updates_tx: Sender<usize>,
         term_updates_rx: Receiver<usize>,
-        commits_tx: Sender<usize>,
-        commits_rx: Receiver<usize>,
+        commits_to_apply_tx: Sender<(usize, LogCommand<C>)>,
+        append_entries_rx: Receiver<usize>,
         new_logs_rx: Receiver<usize>,
-    ) -> Result<ProtocolTasks<S, R>> {
-        let current_state = Arc::new(Mutex::new(ProtocolState::Follower));
-        let commit_index = Arc::new(Mutex::new(0));
+        executor: ThreadPool,
+    ) -> Result<ProtocolTasks<C, R>> {
+        let current_state = Lock::new(ProtocolState::Follower);
+        let commit_index = Lock::new(0);
 
         Ok(ProtocolTasks {
             id,
@@ -244,9 +223,10 @@ impl<S: Storage, R: RPC> ProtocolTasks<S, R> {
             current_state,
             term_updates_tx,
             term_updates_rx,
-            commits_tx,
-            commits_rx,
+            append_entries_rx,
+            commits_to_apply_tx,
             new_logs_rx,
+            executor,
         })
     }
 
@@ -269,32 +249,31 @@ impl<S: Storage, R: RPC> ProtocolTasks<S, R> {
 
     async fn run_follower(&mut self) -> ProtocolState {
         use rand::prelude::*;
-        use tokio::stream::StreamExt;
 
         let timeout = self.timeout.mul_f32(1.0 + rand::thread_rng().gen::<f32>());
 
         loop {
             select! {
                 // Consume the term updates; sender is responsible for updating the storage:
-                _ = self.term_updates_rx.next() => continue,
+                _ = self.term_updates_rx.recv().fuse() => continue,
                 // Actually process commits as they come in
-                state = self.commits_rx.next() => match state {
-                    Some(index) => {
+                state = self.append_entries_rx.recv().fuse() => match state {
+                    Ok(new_index) => {
+                        let storage = self.storage.lock().await;
                         let mut commit_index = self.commit_index.lock().await;
-                        if index > *commit_index {
-                            *commit_index = index;
-                            if let Err(_) = self.commits_tx.send(index).await {
+                        while new_index > *commit_index {
+                            let cmd = storage.get_command(*commit_index).unwrap();
+                            if let Err(_) = self.commits_to_apply_tx.send((*commit_index, cmd)).await {
                                 error!("State machine processing disconnected; shutting down");
                                 return ProtocolState::Shutdown;
                             }
-                        } else {
-                            trace!("Heartbeat received");
+                            *commit_index += 1;
                         }
                     }
                     // Server hung up, no more RPCs:
-                    None => return ProtocolState::Shutdown,
+                    Err(_) => return ProtocolState::Shutdown,
                 },
-                _ = tokio::time::delay_for(timeout) => {
+                _ = crate::time::delay_for(timeout).fuse() => {
                     debug!("Timeout; transitioning to Candidate");
                     return ProtocolState::Candidate
                 }
@@ -303,7 +282,7 @@ impl<S: Storage, R: RPC> ProtocolTasks<S, R> {
     }
 
     async fn run_candidate(&mut self) -> ProtocolState {
-        use futures::stream::{FuturesUnordered, StreamExt};
+        use futures::stream::StreamExt;
 
         let request = match self.init_election().await {
             Ok(req) => req,
@@ -313,17 +292,19 @@ impl<S: Storage, R: RPC> ProtocolTasks<S, R> {
             }
         };
         // Send out the RequestVote RPC calls.
-        let mut votes = FuturesUnordered::new();
+        let (votes_tx, votes_rx) = async_channel::bounded(self.peers.len());
         for peer in self.peers.clone() {
             let request = request.clone();
+            let votes_tx = votes_tx.clone();
             let current_term = request.term;
             let timeout = self.timeout;
-            let vote = self.rpc.request_vote(peer.address.clone(), request);
+            let rpc = self.rpc.clone();
             // Use a timeout on each of them, so that we will
             // have an election result from each within the election timeout.
             let vote = async move {
-                match tokio::time::timeout(timeout, vote).await {
-                    Ok(Ok(rv)) => {
+                let vote = rpc.request_vote(peer.address.clone(), request);
+                match crate::time::timeout(timeout, vote).await {
+                    Some(Ok(rv)) => {
                         if rv.term > current_term {
                             info!("Peer {} is on a newer term {}", peer.id, rv.term);
                             ElectionResult::OutdatedTerm(rv.term)
@@ -338,17 +319,22 @@ impl<S: Storage, R: RPC> ProtocolTasks<S, R> {
                             ElectionResult::NotWinner
                         }
                     }
-                    Ok(Err(e)) => {
+                    Some(Err(e)) => {
                         error!("Error received from peer {}: {}", peer.id, e);
                         ElectionResult::NotWinner
                     }
-                    Err(_) => {
+                    None => {
                         error!("Vote timed out from peer {}", peer.id);
                         ElectionResult::NotWinner
                     }
                 }
-            };
-            votes.push(vote);
+            }
+            .then(|vote| async move {
+                if let Err(_) = votes_tx.send(vote).await {
+                    debug!("Vote receiver has hung up");
+                }
+            });
+            self.executor.spawn_ok(vote);
         }
 
         // Calculate the majority, then tally up the votes as they come in.
@@ -357,7 +343,7 @@ impl<S: Storage, R: RPC> ProtocolTasks<S, R> {
         // If we win a majority of votes, promote to being the leader.
         let majority = calculate_majority(&self.peers);
 
-        let (votes, newer_term) = votes
+        let (votes, newer_term) = votes_rx
             .collect::<Vec<ElectionResult>>()
             .await
             .into_iter()
@@ -402,12 +388,18 @@ impl<S: Storage, R: RPC> ProtocolTasks<S, R> {
     }
 
     async fn run_leader(&mut self) -> ProtocolState {
-        let (new_logs_multi_tx, new_logs_multi_rx) = tokio::sync::watch::channel(0);
-        let (index_update_tx, mut index_update_rx) = channel(1);
+        let (index_update_tx, index_update_rx) = async_channel::bounded(1);
         let mut match_index = HashMap::new();
-        let mut heartbeats = FuturesUnordered::new();
+        let mut hb_updates = Vec::new();
         for peer in self.peers.iter() {
             match_index.insert(peer.id.clone(), 0);
+
+            // We make sure to periodically consume all elements from the heartbeat queue
+            // so this does have a practical bound on the size. What we don't want is for one
+            // heartbeater to block the whole setup. However, slow peers may not receive updates
+            // at a slower pace because of this queue size.
+            let (hb_tx, hb_rx) = async_channel::bounded(10);
+            hb_updates.push(hb_tx);
 
             let hb = Heartbeater::new(
                 self.id.clone(),
@@ -416,78 +408,91 @@ impl<S: Storage, R: RPC> ProtocolTasks<S, R> {
                 index_update_tx.clone(),
                 self.storage.clone(),
                 self.commit_index.clone(),
-                new_logs_multi_rx.clone(),
+                hb_rx,
                 self.term_updates_tx.clone(),
                 self.rpc.clone(),
             );
-            let peer_id = peer.id.clone();
-            let term_updates_tx = self.term_updates_tx.clone();
-            match hb {
-                Ok(mut hb) => heartbeats.push(async move { hb.run().await }),
-                Err(e) => {
-                    error!("Failed to create heartbeat for peer {}: {}", peer_id, e);
-                    return ProtocolState::Follower;
-                }
+            if hb.is_err() {
+                error!(
+                    "Failed to create heartbeat for peer {}: {}",
+                    peer.id,
+                    hb.err().unwrap()
+                );
+                return ProtocolState::Follower;
             }
+            let mut hb = hb.unwrap();
+            self.executor.spawn_ok(async move { hb.run().await });
         }
 
         loop {
             select! {
-                newer_term = self.term_updates_rx.recv() => {
-                    info!("Newer term {:?} discovered - converting to follower", newer_term);
+                _ = self.term_updates_rx.recv().fuse() => {
+                    info!("Newer term discovered - converting to follower");
                     return ProtocolState::Follower;
                 }
-                index = self.new_logs_rx.recv() => {
-                    if let Some(index) = index {
-                        if let Err(_) = new_logs_multi_tx.broadcast(index) {
-                            return ProtocolState::Follower;
-                        }
+                index = self.new_logs_rx.recv().fuse() => {
+                    if let Ok(index) = index {
+                        hb_updates.retain(|hb| match hb.try_send(index) {
+                            Ok(()) => true,
+                            Err(TrySendError::Full(_)) => true,
+                            Err(TrySendError::Closed(_)) => false,
+                        });
                     }
                 }
-                res = index_update_rx.recv() => {
-                    if let Some((peer, index)) = res {
-                        match_index.insert(peer.id, index);
+                res = index_update_rx.recv().fuse() => {
+                    let (peer, index) = match res {
+                        Ok((peer, index)) => (peer, index),
+                        Err(_) => {
+                            error!("We are no longer receiving updates from followers - converting to follower");
+                            return ProtocolState::Follower;
+                        }
+                    };
+                    match_index.insert(peer.id, index);
 
-                        let updated = match_index.iter().filter(|(_, i)| **i >= index).count();
-                        if updated >= calculate_majority(&self.peers) {
-                            let storage = self.storage.lock().await;
-                            match storage.current_term() {
-                                Ok(current_term) => {
-                                    match storage.get_term(index) {
-                                        Ok(Some(term)) => {
-                                            if current_term == term {
-                                                let mut commit_index = self.commit_index.lock().await;
-                                                *commit_index = index;
-                                                if let Err(_) = self.commits_tx.send(index).await {
-                                                    error!("State machine processing disconnected; shutting down");
-                                                    return ProtocolState::Shutdown;
-                                                }
-                                            }
-                                        }
-                                        Ok(None) => {
-                                            error!(
-                                                "Failed to load expected log index {} while processing commit index",
-                                                index
-                                            );
-                                            return ProtocolState::Follower;
-                                        }
-                                        Err(e) => {
-                                            error!(
-                                                "Failed to load log index {} while processing commit index: {}",
-                                                index, e
-                                            );
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    error!("Failed to get current term to process commit index: {}", e);
-                                }
-                            }
+                    match self.leader_update_commit_index(&match_index, index).await {
+                        Ok(Some(state)) => return state,
+                        Ok(None) => {},
+                        Err(e) => {
+                            error!("Failed to update current commit index: {}", e);
                         }
                     }
                 }
             }
         }
+    }
+
+    async fn leader_update_commit_index(
+        &mut self,
+        match_index: &HashMap<String, usize>,
+        index: usize,
+    ) -> Result<Option<ProtocolState>> {
+        let updated = match_index.iter().filter(|(_, i)| **i >= index).count();
+        if updated < calculate_majority(&self.peers) {
+            return Ok(None);
+        }
+        let storage = self.storage.lock().await;
+        let current_term = storage.current_term()?;
+        match storage.get_term(index)? {
+            Some(term) => {
+                if current_term == term {
+                    let cmd = storage.get_command(index)?;
+                    let mut commit_index = self.commit_index.lock().await;
+                    *commit_index = index;
+                    if let Err(_) = self.commits_to_apply_tx.send((index, cmd)).await {
+                        error!("State machine processing disconnected; shutting down");
+                        return Ok(Some(ProtocolState::Shutdown));
+                    }
+                }
+            }
+            None => {
+                error!(
+                    "Failed to load expected log index {} while processing commit index",
+                    index
+                );
+                return Ok(Some(ProtocolState::Follower));
+            }
+        }
+        Ok(None)
     }
 }
 
@@ -506,32 +511,32 @@ enum ElectionResult {
     OutdatedTerm(usize),
 }
 
-struct Heartbeater<S: Storage, R: RPC> {
+struct Heartbeater<C: Command, R: RPC<C>> {
     id: String,
     peer: Peer,
     heartbeat_interval: Duration,
     append_entries_timeout: Duration,
     next_index: usize,
     match_index: Sender<(Peer, usize)>,
-    storage: Arc<Mutex<S>>,
-    commit_index: Arc<Mutex<usize>>,
-    new_logs_rx: tokio::sync::watch::Receiver<usize>,
+    storage: Lock<Box<dyn Storage<C>>>,
+    commit_index: Lock<usize>,
+    new_logs_rx: Receiver<usize>,
     term_updates_tx: Sender<usize>,
     rpc: R,
 }
 
-impl<S: Storage, R: RPC> Heartbeater<S, R> {
+impl<C: Command + 'static, R: RPC<C>> Heartbeater<C, R> {
     fn new(
         id: String,
         peer: Peer,
         timeout: Duration,
         match_index: Sender<(Peer, usize)>,
-        storage: Arc<Mutex<S>>,
-        commit_index: Arc<Mutex<usize>>,
-        new_logs_rx: tokio::sync::watch::Receiver<usize>,
+        storage: Lock<Box<dyn Storage<C>>>,
+        commit_index: Lock<usize>,
+        new_logs_rx: Receiver<usize>,
         term_updates_tx: Sender<usize>,
         rpc: R,
-    ) -> Result<Heartbeater<S, R>> {
+    ) -> Result<Heartbeater<C, R>> {
         let heartbeat_interval = timeout.mul_f32(0.3);
         let append_entries_timeout = timeout.mul_f32(5.0);
         let next_index = futures::executor::block_on(storage.lock()).last_index()?;
@@ -550,12 +555,25 @@ impl<S: Storage, R: RPC> Heartbeater<S, R> {
         })
     }
 
-    async fn run(&mut self) -> Option<usize> {
-        let max_index = select! {
-            _ = tokio::time::delay_for(self.heartbeat_interval) => None,
-            log = self.new_logs_rx.recv() => Some(log),
-        };
-        while let Some(max_index) = max_index {
+    async fn run(&mut self) {
+        loop {
+            let mut max_index = None;
+            // Consume any built-up updates:
+            while let Ok(log) = self.new_logs_rx.try_recv() {
+                max_index = Some(log);
+            }
+            if max_index.is_none() {
+                max_index = select! {
+                    _ = crate::time::delay_for(self.heartbeat_interval).fuse() => None,
+                    log = self.new_logs_rx.recv().fuse() => match log {
+                        Ok(log) => Some(log),
+                        // If the sender hung up, we're no longer leader.
+                        Err(_) => return,
+                    },
+                };
+            }
+
+            // Create the request data
             let (request, current_term, max_index_sent) = match self.create_request(max_index).await
             {
                 Ok(req) => req,
@@ -564,13 +582,21 @@ impl<S: Storage, R: RPC> Heartbeater<S, R> {
                     continue;
                 }
             };
+            // Send the request
             let response = self.rpc.append_entries(self.peer.address.clone(), request);
+            // Only wait for so long before we consider it a failure:
+            let response = crate::time::timeout(self.append_entries_timeout, response);
 
-            match tokio::time::timeout(self.append_entries_timeout, response).await {
-                Ok(Ok(resp)) => {
+            match response.await {
+                Some(Ok(resp)) => {
                     if resp.term > current_term {
                         info!("Peer {} is on a newer term {}", self.peer.id, resp.term);
-                        return Some(resp.term);
+                        let mut storage = self.storage.lock().await;
+                        storage.set_current_term(resp.term).unwrap();
+                        if self.term_updates_tx.send(resp.term).await.is_err() {
+                            // service is shutting down
+                        }
+                        return;
                     } else if !resp.success {
                         info!(
                             "Peer {} could not process log index {}",
@@ -583,34 +609,35 @@ impl<S: Storage, R: RPC> Heartbeater<S, R> {
                         debug!("Peer {} processed AppendEntries successfully", self.peer.id);
                         if let Some(max_index) = max_index_sent {
                             self.next_index = max_index + 1;
-                            if let Err(_) =
-                                self.match_index.send((self.peer.clone(), max_index)).await
+                            if self
+                                .match_index
+                                .send((self.peer.clone(), max_index))
+                                .await
+                                .is_err()
                             {
                                 // The leader is no longer listening for updates, we must be in a different state now
-                                return None;
+                                return;
                             }
                         }
                     }
                 }
-                Ok(Err(e)) => {
+                Some(Err(e)) => {
                     error!(
                         "Error received from AppendEntries request to peer {}: {}",
                         self.peer.id, e
                     );
                 }
-                Err(_) => {
+                None => {
                     error!("AppendEntries request timed out to peer {}", self.peer.id);
                 }
             }
         }
-        // Update channel closed; we don't know if there's a newer term.
-        None
     }
 
     async fn create_request(
         &mut self,
         max_index: Option<usize>,
-    ) -> Result<(AppendEntriesRequest, usize, Option<usize>)> {
+    ) -> Result<(AppendEntriesRequest<C>, usize, Option<usize>)> {
         let leader_commit = { *self.commit_index.lock().await };
         let storage = self.storage.lock().await;
         let term = storage.current_term()?;

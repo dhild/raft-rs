@@ -4,19 +4,30 @@ version = "0.1.0"
 authors = ["D. Ryan Hild <d.ryan.hild@gmail.com>"]
 edition = "2018"
 
-[workspace]
-members = [
-  "pontoon-consensus",
-]
-
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
-[dependencies]
-log = "^0"
-env_logger = "^0"
-clap = { version = "^2", features = ["yaml"] }
+[features]
+default = ["memory-storage", "http-rpc"]
+memory-storage = []
+http-rpc = ["hyper", "serde_json"]
 
-[[bin]]
-name = "raft"
-path = "src/bin/raft.rs"
-required-features = ["runtime"]
+[dependencies]
+log = "0.4"
+rand = "0.7"
+async-channel = "1.1"
+async-lock = "1.1"
+async-trait = "0.1"
+bytes = {version = "0.5", features = ["serde"]}
+serde = {version = "1.0", features = ["derive"]}
+futures = {version = "0.3", features = ["thread-pool"]}
+serde_json = {version = "1.0", optional = true}
+hyper = {version = "0.13", optional = true}
+tokio = {version = "0.2", features = ["time"]}
+
+[dev-dependencies]
+env_logger = "0.7"
+
+#[[bin]]
+#name = "raft"
+#path = "src/bin/raft.rs"
+#required-features = ["runtime"]
