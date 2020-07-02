@@ -3,12 +3,10 @@ use crate::state::{Command, StateMachine, StateMachineApplier};
 use crate::storage::{LogCommand, LogEntry, Storage};
 use async_channel::{Receiver, Sender, TrySendError};
 use async_lock::Lock;
-use futures::executor::ThreadPool;
-use futures::prelude::*;
-use futures::select;
 use log::{debug, error, info, trace};
 use std::collections::HashMap;
 use std::time::Duration;
+use tokio::select;
 
 #[derive(Clone)]
 pub struct Peer {
@@ -27,7 +25,7 @@ impl Peer {
     }
 }
 
-pub fn start<S, R, M>(
+pub async fn start<S, R, M>(
     id: String,
     peers: Vec<Peer>,
     timeout: Duration,
@@ -46,8 +44,6 @@ where
     let (term_updates_tx, term_updates_rx) = async_channel::bounded(1);
     let (new_logs_tx, new_logs_rx) = async_channel::bounded(1);
 
-    let executor = ThreadPool::new()?;
-
     let mut tasks = ProtocolTasks::start(
         id,
         peers,
@@ -59,7 +55,6 @@ where
         commits_protocol_tx,
         commits_protocol_rx,
         new_logs_rx,
-        executor.clone(),
     );
 
     let consensus = Consensus {
@@ -71,11 +66,11 @@ where
 
     let (state_machine, applier) = M::build(consensus);
 
-    executor.spawn_ok(async move {
+    tokio::spawn(async move {
         let mut lc = LogCommitter::new(applier, commits_to_apply_rx, last_applied_tx);
         lc.run().await
     });
-    executor.spawn_ok(async move { tasks.run().await });
+    tokio::spawn(async move { tasks.run().await });
 
     let raft_server = RaftServer::new(storage.clone(), term_updates_tx, commits_tx);
 
@@ -258,7 +253,6 @@ pub struct ProtocolTasks<S: Storage, R: RPC> {
     append_entries_rx: Receiver<usize>,
     commits_to_apply_tx: Sender<(usize, LogCommand)>,
     new_logs_rx: Receiver<usize>,
-    executor: ThreadPool,
 }
 
 impl<S: Storage, R: RPC> ProtocolTasks<S, R> {
@@ -273,7 +267,6 @@ impl<S: Storage, R: RPC> ProtocolTasks<S, R> {
         commits_to_apply_tx: Sender<(usize, LogCommand)>,
         append_entries_rx: Receiver<usize>,
         new_logs_rx: Receiver<usize>,
-        executor: ThreadPool,
     ) -> ProtocolTasks<S, R> {
         let current_state = Lock::new(ProtocolState::Follower);
         let commit_index = Lock::new(0);
@@ -291,7 +284,6 @@ impl<S: Storage, R: RPC> ProtocolTasks<S, R> {
             append_entries_rx,
             commits_to_apply_tx,
             new_logs_rx,
-            executor,
         }
     }
 
@@ -320,9 +312,9 @@ impl<S: Storage, R: RPC> ProtocolTasks<S, R> {
         loop {
             select! {
                 // Consume the term updates; sender is responsible for updating the storage:
-                _ = self.term_updates_rx.recv().fuse() => continue,
+                _ = self.term_updates_rx.recv() => continue,
                 // Actually process commits as they come in
-                state = self.append_entries_rx.recv().fuse() => match state {
+                state = self.append_entries_rx.recv() => match state {
                     Ok(new_index) => {
                         let storage = self.storage.lock().await;
                         let mut commit_index = self.commit_index.lock().await;
@@ -338,7 +330,7 @@ impl<S: Storage, R: RPC> ProtocolTasks<S, R> {
                     // Server hung up, no more RPCs:
                     Err(_) => return ProtocolState::Shutdown,
                 },
-                _ = crate::time::delay_for(timeout).fuse() => {
+                _ = tokio::time::delay_for(timeout) => {
                     debug!("Timeout; transitioning to Candidate");
                     return ProtocolState::Candidate
                 }
@@ -347,7 +339,7 @@ impl<S: Storage, R: RPC> ProtocolTasks<S, R> {
     }
 
     async fn run_candidate(&mut self) -> ProtocolState {
-        use futures::stream::StreamExt;
+        use tokio::stream::StreamExt;
 
         let request = match self.init_election().await {
             Ok(req) => req,
@@ -366,10 +358,10 @@ impl<S: Storage, R: RPC> ProtocolTasks<S, R> {
             let rpc = self.rpc.clone();
             // Use a timeout on each of them, so that we will
             // have an election result from each within the election timeout.
-            let vote = async move {
+            tokio::spawn(async move {
                 let vote = rpc.request_vote(peer.address.clone(), request);
-                match crate::time::timeout(timeout, vote).await {
-                    Some(Ok(rv)) => {
+                let vote = match tokio::time::timeout(timeout, vote).await {
+                    Ok(Ok(rv)) => {
                         if rv.term > current_term {
                             info!("Peer {} is on a newer term {}", peer.id, rv.term);
                             ElectionResult::OutdatedTerm(rv.term)
@@ -384,22 +376,19 @@ impl<S: Storage, R: RPC> ProtocolTasks<S, R> {
                             ElectionResult::NotWinner
                         }
                     }
-                    Some(Err(e)) => {
+                    Ok(Err(e)) => {
                         error!("Error received from peer {}: {}", peer.id, e);
                         ElectionResult::NotWinner
                     }
-                    None => {
+                    Err(_) => {
                         error!("Vote timed out from peer {}", peer.id);
                         ElectionResult::NotWinner
                     }
-                }
-            }
-            .then(|vote| async move {
+                };
                 if let Err(_) = votes_tx.send(vote).await {
                     debug!("Vote receiver has hung up");
                 }
             });
-            self.executor.spawn_ok(vote);
         }
 
         // Calculate the majority, then tally up the votes as they come in.
@@ -496,16 +485,16 @@ impl<S: Storage, R: RPC> ProtocolTasks<S, R> {
                 self.rpc.clone(),
                 last_index + 1,
             );
-            self.executor.spawn_ok(async move { hb.run().await });
+            tokio::spawn(async move { hb.run().await });
         }
 
         loop {
             select! {
-                _ = self.term_updates_rx.recv().fuse() => {
+                _ = self.term_updates_rx.recv() => {
                     info!("Newer term discovered - converting to follower");
                     return ProtocolState::Follower;
                 }
-                log = self.new_logs_rx.recv().fuse() => {
+                log = self.new_logs_rx.recv() => {
                     if let Ok(index) = log {
                         hb_updates.retain(|hb| match hb.try_send(index) {
                             Ok(()) => true,
@@ -516,7 +505,7 @@ impl<S: Storage, R: RPC> ProtocolTasks<S, R> {
                         return ProtocolState::Shutdown;
                     }
                 }
-                res = index_update_rx.recv().fuse() => {
+                res = index_update_rx.recv() => {
                     let (peer, index) = match res {
                         Ok((peer, index)) => (peer, index),
                         Err(_) => {
@@ -648,8 +637,8 @@ impl<S: Storage, R: RPC> Heartbeater<S, R> {
             }
             if max_index.is_none() {
                 max_index = select! {
-                    _ = crate::time::delay_for(self.heartbeat_interval).fuse() => None,
-                    log = self.new_logs_rx.recv().fuse() => match log {
+                    _ = tokio::time::delay_for(self.heartbeat_interval) => None,
+                    log = self.new_logs_rx.recv() => match log {
                         Ok(log) => Some(log),
                         // If the sender hung up, we're no longer leader.
                         Err(_) => return,
@@ -669,10 +658,8 @@ impl<S: Storage, R: RPC> Heartbeater<S, R> {
             // Send the request
             let response = self.rpc.append_entries(self.peer.address.clone(), request);
             // Only wait for so long before we consider it a failure:
-            let response = crate::time::timeout(self.append_entries_timeout, response);
-
-            match response.await {
-                Some(Ok(resp)) => {
+            match tokio::time::timeout(self.append_entries_timeout, response).await {
+                Ok(Ok(resp)) => {
                     if resp.term > current_term {
                         info!("Peer {} is on a newer term {}", self.peer.id, resp.term);
                         let mut storage = self.storage.lock().await;
@@ -705,13 +692,13 @@ impl<S: Storage, R: RPC> Heartbeater<S, R> {
                         }
                     }
                 }
-                Some(Err(e)) => {
+                Ok(Err(e)) => {
                     error!(
                         "Error received from AppendEntries request to peer {}: {}",
                         self.peer.id, e
                     );
                 }
-                None => {
+                Err(_) => {
                     error!("AppendEntries request timed out to peer {}", self.peer.id);
                 }
             }
