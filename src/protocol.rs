@@ -10,50 +10,49 @@ use tokio::select;
 
 #[derive(Clone)]
 pub struct Peer {
-    id: String,
-    address: String,
-    voting: bool,
+    pub id: String,
+    pub address: String,
+    pub voting: bool,
 }
 
-impl Peer {
-    pub fn voting(id: String, address: String) -> Peer {
-        Peer {
-            id,
-            address,
-            voting: true,
-        }
-    }
-}
-
-pub async fn start<S, R, M>(
+pub fn start<R, S, M>(
     id: String,
     peers: Vec<Peer>,
     timeout: Duration,
+    rpc_config: R::ServerConfig,
     storage: S,
-    rpc: R,
 ) -> Result<M, std::io::Error>
 where
-    S: Storage,
     R: RPC,
+    S: Storage,
     M: StateMachine<S>,
 {
+    let rt = tokio::runtime::Builder::new()
+        .threaded_scheduler()
+        .enable_time()
+        .enable_io()
+        .build()?;
     let storage = Lock::new(storage);
-    let (commits_protocol_tx, commits_to_apply_rx) = async_channel::bounded(1);
-    let (commits_tx, commits_protocol_rx) = async_channel::bounded(1);
+    let (commits_to_apply_tx, commits_to_apply_rx) = async_channel::bounded(1);
+    let (append_entries_tx, append_entries_rx) = async_channel::bounded(1);
     let (last_applied_tx, last_applied_rx) = async_channel::bounded(1);
     let (term_updates_tx, term_updates_rx) = async_channel::bounded(1);
     let (new_logs_tx, new_logs_rx) = async_channel::bounded(1);
 
-    let mut tasks = ProtocolTasks::start(
+    let raft_server = RaftServer::new(storage.clone(), term_updates_tx.clone(), append_entries_tx);
+
+    let rpc = R::start(rpc_config, raft_server, rt.handle())?;
+
+    let mut tasks = ProtocolTasks::new(
         id,
         peers,
         timeout,
         storage.clone(),
         rpc,
-        term_updates_tx.clone(),
+        term_updates_tx,
         term_updates_rx,
-        commits_protocol_tx,
-        commits_protocol_rx,
+        commits_to_apply_tx,
+        append_entries_rx,
         new_logs_rx,
     );
 
@@ -66,13 +65,11 @@ where
 
     let (state_machine, applier) = M::build(consensus);
 
-    tokio::spawn(async move {
+    rt.spawn(async move {
         let mut lc = LogCommitter::new(applier, commits_to_apply_rx, last_applied_tx);
         lc.run().await
     });
-    tokio::spawn(async move { tasks.run().await });
-
-    let raft_server = RaftServer::new(storage.clone(), term_updates_tx, commits_tx);
+    rt.spawn(async move { tasks.run().await });
 
     Ok(state_machine)
 }
@@ -256,7 +253,7 @@ pub struct ProtocolTasks<S: Storage, R: RPC> {
 }
 
 impl<S: Storage, R: RPC> ProtocolTasks<S, R> {
-    fn start(
+    fn new(
         id: String,
         peers: Vec<Peer>,
         timeout: Duration,
@@ -708,7 +705,7 @@ impl<S: Storage, R: RPC> Heartbeater<S, R> {
     async fn create_request(
         &mut self,
         max_index: Option<usize>,
-    ) -> Result<(AppendEntriesRequest, usize, Option<usize>), S::Error> {
+    ) -> std::io::Result<(AppendEntriesRequest, usize, Option<usize>)> {
         let leader_commit = { *self.commit_index.lock().await };
         let storage = self.storage.lock().await;
         let term = storage.current_term()?;

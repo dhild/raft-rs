@@ -22,6 +22,9 @@ pub trait StateMachine<S: Storage>: Sized {
 }
 
 #[cfg(feature = "kv-store")]
+pub use kv::{KVCommand, KeyValueStore};
+
+#[cfg(feature = "kv-store")]
 mod kv {
     use crate::error::Result;
     use crate::state::{Command, StateMachineApplier};

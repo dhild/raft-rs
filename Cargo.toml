@@ -7,9 +7,10 @@ edition = "2018"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [features]
-default = ["memory-storage", "kv-store"]
+default = ["memory-storage", "kv-store", "http-rpc"]
 memory-storage = []
 kv-store = ["serde_json"]
+http-rpc = ["serde_json", "hyper"]
 
 [dependencies]
 log = "0.4"
@@ -21,6 +22,8 @@ bytes = {version = "0.5", features = ["serde"]}
 serde = {version = "1.0", features = ["derive"]}
 serde_json = {version = "1.0", optional = true}
 tokio = {version = "0.2", features = ["time", "rt-threaded", "rt-core", "macros", "stream"]}
+hyper = {version = "0.13", optional = true}
+futures = "0.3"
 
 [dev-dependencies]
 env_logger = "0.7"
