@@ -29,9 +29,8 @@ impl RPC for HttpRPC {
     fn start<S: Storage>(
         config: Self::ServerConfig,
         server: RaftServer<S>,
-        handle: &tokio::runtime::Handle,
     ) -> Result<Self, std::io::Error> {
-        start_server(config.address.clone(), Arc::new(server), handle)?;
+        start_server(config.address.clone(), Arc::new(server))?;
         Ok(Self::new())
     }
 
@@ -55,7 +54,6 @@ impl RPC for HttpRPC {
 fn start_server<A: ToSocketAddrs, S: Storage>(
     addr: A,
     server: Arc<RaftServer<S>>,
-    handle: &tokio::runtime::Handle,
 ) -> Result<(), std::io::Error> {
     let addrs = addr.to_socket_addrs()?;
     for addr in addrs {
@@ -76,7 +74,7 @@ fn start_server<A: ToSocketAddrs, S: Storage>(
             }
         });
         let server = Server::bind(&addr).serve(make_svc);
-        handle.spawn(async move {
+        tokio::spawn(async move {
             if let Err(e) = server.await {
                 error!("Server error: {}", e);
             }

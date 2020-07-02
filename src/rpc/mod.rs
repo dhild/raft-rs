@@ -73,7 +73,6 @@ pub trait RPC: Clone + Send + Sync + 'static {
     fn start<S: Storage>(
         config: Self::ServerConfig,
         server: RaftServer<S>,
-        executor: &tokio::runtime::Handle,
     ) -> Result<Self, std::io::Error>;
 
     async fn append_entries(

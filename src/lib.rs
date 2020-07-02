@@ -50,14 +50,16 @@ pub struct StorageConfig {
 
 impl Config {
     #[cfg(feature = "kv-store")]
-    pub fn build_key_value_store(&mut self) -> Result<KeyValueStore<impl Storage>, std::io::Error> {
+    pub async fn build_key_value_store(
+        &self,
+    ) -> Result<KeyValueStore<impl Storage>, std::io::Error> {
         let id = self.id.clone();
         let peers = self.peers();
         let timeout = self.timeout.unwrap_or(Duration::from_millis(500));
 
         let storage = self.storage.build()?;
 
-        self.rpc.build(id, peers, timeout, storage)
+        self.rpc.build(id, peers, timeout, storage).await
     }
 
     fn peers(&self) -> Vec<Peer> {
@@ -77,8 +79,8 @@ impl Config {
 }
 
 impl RPCConfig {
-    pub fn build<S: Storage, SM: StateMachine<S>>(
-        &mut self,
+    pub async fn build<S: Storage, SM: StateMachine<S>>(
+        &self,
         id: String,
         peers: Vec<Peer>,
         timeout: Duration,
@@ -87,7 +89,7 @@ impl RPCConfig {
         #[cfg(feature = "http-rpc")]
         if let Some(ref cfg) = self.http {
             let state_machine =
-                protocol::start::<HttpRPC, S, SM>(id, peers, timeout, cfg.clone(), storage)?;
+                protocol::start::<HttpRPC, S, SM>(id, peers, timeout, cfg.clone(), storage).await?;
             return Ok(state_machine);
         }
         Err(std::io::Error::new(
@@ -98,7 +100,7 @@ impl RPCConfig {
 }
 
 impl StorageConfig {
-    pub fn build(&mut self) -> Result<impl Storage, std::io::Error> {
+    pub fn build(&self) -> Result<impl Storage, std::io::Error> {
         #[cfg(feature = "memory-storage")]
         if let Some(ref cfg) = self.memory {
             let storage = MemoryStorage::new(cfg.clone())?;

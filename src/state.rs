@@ -42,15 +42,15 @@ mod kv {
     }
 
     impl<S: Storage> KeyValueStore<S> {
-        pub async fn put(&mut self, key: &str, value: &[u8]) -> Result<()> {
-            self.consensus
+        pub async fn put(&mut self, key: &str, value: &[u8]) -> Result<usize> {
+            let index = self
+                .consensus
                 .commit(KVCommand::Put {
                     key: key.into(),
                     value: value.to_vec().into(),
                 })
                 .await?;
-
-            Ok(())
+            Ok(index)
         }
 
         pub async fn get(&self, key: &str) -> Option<Bytes> {

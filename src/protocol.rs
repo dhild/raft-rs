@@ -4,7 +4,9 @@ use crate::storage::{LogCommand, LogEntry, Storage};
 use async_channel::{Receiver, Sender, TrySendError};
 use async_lock::Lock;
 use log::{debug, error, info, trace};
+use rand::{thread_rng, Rng};
 use std::collections::HashMap;
+use std::ops::Add;
 use std::time::Duration;
 use tokio::select;
 
@@ -15,7 +17,7 @@ pub struct Peer {
     pub voting: bool,
 }
 
-pub fn start<R, S, M>(
+pub async fn start<R, S, M>(
     id: String,
     peers: Vec<Peer>,
     timeout: Duration,
@@ -27,11 +29,6 @@ where
     S: Storage,
     M: StateMachine<S>,
 {
-    let rt = tokio::runtime::Builder::new()
-        .threaded_scheduler()
-        .enable_time()
-        .enable_io()
-        .build()?;
     let storage = Lock::new(storage);
     let (commits_to_apply_tx, commits_to_apply_rx) = async_channel::bounded(1);
     let (append_entries_tx, append_entries_rx) = async_channel::bounded(1);
@@ -41,7 +38,7 @@ where
 
     let raft_server = RaftServer::new(storage.clone(), term_updates_tx.clone(), append_entries_tx);
 
-    let rpc = R::start(rpc_config, raft_server, rt.handle())?;
+    let rpc = R::start(rpc_config, raft_server)?;
 
     let mut tasks = ProtocolTasks::new(
         id,
@@ -65,11 +62,11 @@ where
 
     let (state_machine, applier) = M::build(consensus);
 
-    rt.spawn(async move {
+    tokio::spawn(async move {
         let mut lc = LogCommitter::new(applier, commits_to_apply_rx, last_applied_tx);
         lc.run().await
     });
-    rt.spawn(async move { tasks.run().await });
+    tokio::spawn(async move { tasks.run().await });
 
     Ok(state_machine)
 }
@@ -304,7 +301,9 @@ impl<S: Storage, R: RPC> ProtocolTasks<S, R> {
     async fn run_follower(&mut self) -> ProtocolState {
         use rand::prelude::*;
 
-        let timeout = self.timeout.mul_f32(1.0 + rand::thread_rng().gen::<f32>());
+        let timeout = self
+            .timeout
+            .mul_f32(1. + 2. * rand::thread_rng().gen::<f32>());
 
         loop {
             select! {
@@ -337,6 +336,8 @@ impl<S: Storage, R: RPC> ProtocolTasks<S, R> {
 
     async fn run_candidate(&mut self) -> ProtocolState {
         use tokio::stream::StreamExt;
+        let deadline = tokio::time::Instant::now()
+            .add(self.timeout.mul_f32(1. + 2. * thread_rng().gen::<f32>()));
 
         let request = match self.init_election().await {
             Ok(req) => req,
@@ -387,6 +388,8 @@ impl<S: Storage, R: RPC> ProtocolTasks<S, R> {
                 }
             });
         }
+        // Drop the transmission so that we can close the election term after receiving vote data
+        drop(votes_tx);
 
         // Calculate the majority, then tally up the votes as they come in.
         // If we end up with an outdated term, update the stored value and drop to being a follower.
@@ -394,29 +397,31 @@ impl<S: Storage, R: RPC> ProtocolTasks<S, R> {
         // If we win a majority of votes, promote to being the leader.
         let majority = calculate_majority(&self.peers);
 
-        let (votes, newer_term) = votes_rx
-            .collect::<Vec<ElectionResult>>()
-            .await
-            .into_iter()
-            .fold((1, None), |(votes, newer_term), vote| match vote {
-                ElectionResult::OutdatedTerm(t) => (votes, Some(t)),
-                ElectionResult::Winner => (votes + 1, newer_term),
-                ElectionResult::NotWinner => (votes, newer_term),
-            });
-        if let Some(t) = newer_term {
-            let mut storage = self.storage.lock().await;
-            storage
-                .set_current_term(t)
-                .unwrap_or_else(|e| error!("Could not set newer term {}: {}", t, e));
-            storage
-                .set_voted_for(None)
-                .unwrap_or_else(|e| error!("Could not clear vote: {}", e));
-            ProtocolState::Follower
-        } else if votes >= majority {
-            ProtocolState::Leader
-        } else {
-            ProtocolState::Candidate
+        let mut votes = 1;
+        while let Ok(vote) = votes_rx.recv().await {
+            match vote {
+                ElectionResult::Winner => {
+                    votes += 1;
+                    if votes >= majority {
+                        return ProtocolState::Leader;
+                    }
+                }
+                ElectionResult::NotWinner => {}
+                ElectionResult::OutdatedTerm(term) => {
+                    let mut storage = self.storage.lock().await;
+                    storage
+                        .set_current_term(term)
+                        .unwrap_or_else(|e| error!("Could not set newer term {}: {}", term, e));
+                    storage
+                        .set_voted_for(None)
+                        .unwrap_or_else(|e| error!("Could not clear vote: {}", e));
+                    return ProtocolState::Follower;
+                }
+            }
         }
+        // Not enough voted for us. Wait out the timer, then try again.
+        tokio::time::delay_until(deadline).await;
+        ProtocolState::Candidate
     }
 
     async fn init_election(&mut self) -> Result<RequestVoteRequest, ProtocolError> {
