@@ -1,13 +1,8 @@
-use log::{debug, info, trace};
-
 mod common;
 
 #[tokio::test]
 async fn test_consensus_replication() {
     common::setup();
-    info!("Test Log");
-    debug!("Test Log");
-    trace!("Test Log");
     let mut sm1 = common::state_machine(CONFIG_1).await;
     let sm2 = common::state_machine(CONFIG_2).await;
     let sm3 = common::state_machine(CONFIG_3).await;

@@ -3,9 +3,6 @@
 //! `pontoon_consensus` provides the core consensus module.
 #![recursion_limit = "512"]
 
-use crate::rpc::{HttpConfig, HttpRPC};
-use std::time::Duration;
-
 mod error;
 mod protocol;
 pub mod rpc;
@@ -13,11 +10,13 @@ pub mod state;
 pub mod storage;
 
 use crate::protocol::Peer;
+use crate::rpc::HttpConfig;
 use crate::state::KeyValueStore;
 use crate::storage::{MemoryConfig, MemoryStorage};
 pub use protocol::Consensus;
 use serde::{Deserialize, Serialize};
 pub use state::StateMachine;
+use std::time::Duration;
 pub use storage::Storage;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -88,8 +87,7 @@ impl RPCConfig {
     ) -> Result<SM, std::io::Error> {
         #[cfg(feature = "http-rpc")]
         if let Some(ref cfg) = self.http {
-            let state_machine =
-                protocol::start::<HttpRPC, S, SM>(id, peers, timeout, cfg.clone(), storage).await?;
+            let state_machine = protocol::start(id, peers, timeout, cfg.clone(), storage).await?;
             return Ok(state_machine);
         }
         Err(std::io::Error::new(
@@ -103,7 +101,7 @@ impl StorageConfig {
     pub fn build(&self) -> Result<impl Storage, std::io::Error> {
         #[cfg(feature = "memory-storage")]
         if let Some(ref cfg) = self.memory {
-            let storage = MemoryStorage::new(cfg.clone())?;
+            let storage: MemoryStorage = cfg.into();
             return Ok(storage);
         }
         Err(std::io::Error::new(

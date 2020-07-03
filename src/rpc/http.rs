@@ -1,5 +1,5 @@
 use crate::rpc::{
-    AppendEntriesRequest, AppendEntriesResponse, RaftServer, RequestVoteRequest,
+    AppendEntriesRequest, AppendEntriesResponse, RPCBuilder, RaftServer, RequestVoteRequest,
     RequestVoteResponse, RPC,
 };
 use crate::storage::Storage;
@@ -20,20 +20,19 @@ pub struct HttpConfig {
     pub address: String,
 }
 
+impl RPCBuilder for HttpConfig {
+    type RPC = HttpRPC;
+
+    fn build<S: Storage>(&self, server: RaftServer<S>) -> std::io::Result<Self::RPC> {
+        start_server(self.address.clone(), Arc::new(server))?;
+        Ok(HttpRPC::new())
+    }
+}
+
 pub type HttpRPC = hyper::Client<hyper::client::HttpConnector>;
 
 #[async_trait::async_trait]
 impl RPC for HttpRPC {
-    type ServerConfig = HttpConfig;
-
-    fn start<S: Storage>(
-        config: Self::ServerConfig,
-        server: RaftServer<S>,
-    ) -> Result<Self, std::io::Error> {
-        start_server(config.address.clone(), Arc::new(server))?;
-        Ok(Self::new())
-    }
-
     async fn append_entries(
         &self,
         peer_address: String,

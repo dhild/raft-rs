@@ -66,15 +66,13 @@ impl RequestVoteResponse {
     }
 }
 
+pub trait RPCBuilder {
+    type RPC: RPC;
+    fn build<S: Storage>(&self, server: RaftServer<S>) -> std::io::Result<Self::RPC>;
+}
+
 #[async_trait]
 pub trait RPC: Clone + Send + Sync + 'static {
-    type ServerConfig;
-
-    fn start<S: Storage>(
-        config: Self::ServerConfig,
-        server: RaftServer<S>,
-    ) -> Result<Self, std::io::Error>;
-
     async fn append_entries(
         &self,
         peer_address: String,
@@ -91,14 +89,14 @@ pub trait RPC: Clone + Send + Sync + 'static {
 #[derive(Clone)]
 pub struct RaftServer<S: Storage> {
     storage: Lock<S>,
-    term_updates: Sender<usize>,
+    term_updates: Sender<()>,
     append_entries_tx: Sender<usize>,
 }
 
 impl<S: Storage> RaftServer<S> {
     pub fn new(
         storage: Lock<S>,
-        term_updates: Sender<usize>,
+        term_updates: Sender<()>,
         append_entries_tx: Sender<usize>,
     ) -> RaftServer<S> {
         RaftServer {
@@ -118,7 +116,8 @@ impl<S: Storage> RaftServer<S> {
         // Ensure we are on the latest term
         if req.term > current_term {
             storage.set_current_term(req.term)?;
-            if self.term_updates.send(req.term).await.is_err() {
+            storage.set_voted_for(None)?;
+            if self.term_updates.send(()).await.is_err() {
                 error!("Raft protocol has been shut down");
             }
             return Ok(AppendEntriesResponse::failed(current_term));
@@ -178,7 +177,7 @@ impl<S: Storage> RaftServer<S> {
             let current_term = storage.current_term()?;
             if req.term > current_term {
                 storage.set_current_term(req.term)?;
-                if self.term_updates.send(req.term).await.is_err() {
+                if self.term_updates.send(()).await.is_err() {
                     error!("Raft protocol has been shut down");
                     return Ok(RequestVoteResponse::failed(current_term));
                 }
