@@ -33,6 +33,9 @@ impl Storage for MemoryStorage {
     }
 
     fn set_current_term(&mut self, current_term: usize) -> Result<()> {
+        if current_term != self.current_term {
+            self.voted_for = None;
+        }
         self.current_term = current_term;
         Ok(())
     }
@@ -65,10 +68,16 @@ impl Storage for MemoryStorage {
     }
 
     fn get_term(&self, log_index: usize) -> Result<Option<usize>> {
+        if log_index == 0 {
+            return Ok(Some(0));
+        }
         Ok(self.entries.get(log_index - 1).map(|e| e.term))
     }
 
     fn get_command(&self, log_index: usize) -> Result<LogCommand> {
+        if log_index == 0 {
+            return Ok(LogCommand::Noop);
+        }
         Ok(self
             .entries
             .get(log_index - 1)

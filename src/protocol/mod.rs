@@ -1,7 +1,7 @@
 use crate::rpc::{AppendEntriesRequest, RPCBuilder, RaftServer, RequestVoteRequest, RPC};
 use crate::state::{Command, StateMachine, StateMachineApplier};
 use crate::storage::{LogCommand, LogEntry, Storage};
-use async_channel::{Receiver, Sender, TryRecvError, TrySendError};
+use async_channel::{Receiver, RecvError, Sender, TryRecvError, TrySendError};
 use async_lock::Lock;
 use log::{debug, error, info, trace};
 use rand::Rng;
@@ -639,7 +639,7 @@ pub struct Leader<S: Storage> {
     new_logs_rx: Receiver<usize>,
     index_update_rx: Receiver<(String, usize)>,
     match_index: HashMap<String, usize>,
-    heartbeat_updates: Vec<Sender<usize>>,
+    forward_updates: Vec<Sender<usize>>,
 }
 
 impl<S: Storage> Leader<S> {
@@ -657,17 +657,13 @@ impl<S: Storage> Leader<S> {
     ) -> std::io::Result<Leader<S>> {
         let timeout = timeout.mul_f32(0.5);
         let (index_update_tx, index_update_rx) = async_channel::bounded(peers.len());
-        let mut heartbeat_updates = Vec::new();
+        let mut forward_updates = Vec::new();
         let next_index = { storage.lock().await.last_index()? + 1 };
         for peer in peers.iter() {
-            // We make sure to periodically consume all elements from the heartbeat queue
-            // so this does have a practical bound on the size. What we don't want is for one
-            // heartbeater to block the whole setup. Slow acting peers may receive multiple updates
-            // at a time.
-            let (hb_tx, hb_rx) = async_channel::bounded(10);
-            heartbeat_updates.push(hb_tx);
+            let (hb_tx, hb_rx) = async_channel::bounded(1);
+            forward_updates.push(hb_tx);
 
-            let mut hb = Heartbeater::new(
+            let mut hb = Forwarder::new(
                 id.clone(),
                 peer.clone(),
                 timeout,
@@ -689,7 +685,7 @@ impl<S: Storage> Leader<S> {
             commits_to_apply_tx,
             new_logs_rx,
             index_update_rx,
-            heartbeat_updates,
+            forward_updates,
         ))
     }
 
@@ -701,7 +697,7 @@ impl<S: Storage> Leader<S> {
         commits_to_apply_tx: Sender<(usize, LogCommand)>,
         new_logs_rx: Receiver<usize>,
         index_update_rx: Receiver<(String, usize)>,
-        heartbeat_updates: Vec<Sender<usize>>,
+        forward_updates: Vec<Sender<usize>>,
     ) -> Leader<S> {
         Leader {
             peers,
@@ -712,7 +708,7 @@ impl<S: Storage> Leader<S> {
             new_logs_rx,
             index_update_rx,
             match_index: HashMap::new(),
-            heartbeat_updates,
+            forward_updates,
         }
     }
 
@@ -751,12 +747,11 @@ impl<S: Storage> Leader<S> {
     fn advertise_new_log(&mut self, index: usize) {
         // Try to submit a new index, but don't block if the queue is full.
         // Discard any peer connections that have hung up.
-        self.heartbeat_updates
-            .retain(|hb| match hb.try_send(index) {
-                Ok(()) => true,
-                Err(TrySendError::Full(_)) => true,
-                Err(TrySendError::Closed(_)) => false,
-            });
+        self.forward_updates.retain(|hb| match hb.try_send(index) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_)) => true,
+            Err(TrySendError::Closed(_)) => false,
+        });
     }
 
     async fn process_index_update(&mut self, peer_id: String, index: usize) -> ProtocolState {
@@ -773,12 +768,14 @@ impl<S: Storage> Leader<S> {
 
     async fn update_commit_index(&self, index: usize) -> std::io::Result<ProtocolState> {
         // Find the number of voting peers that have this new index value or greater.
+        // Add one to that count for ourselves; the matched index is always on the leader.
         let updated = self
             .match_index
             .iter()
             .filter(|(_, i)| **i >= index)
             .filter(|(peer_id, _)| self.peers.iter().any(|p| &p.id == *peer_id && p.voting))
-            .count();
+            .count()
+            + 1;
 
         // See if there are enough with the log persisted to consider it committed
         if self
@@ -794,10 +791,12 @@ impl<S: Storage> Leader<S> {
         let current_term = storage.current_term()?;
         match storage.get_term(index)? {
             Some(term) => {
-                // As long as we are in the current term, apply the log
-                if current_term == term {
+                let mut commit_index = self.commit_index.lock().await;
+                // To ensure data integrity, we do not commit entries that did not originate in
+                // this term. This ensures that a committed entry had the same leader from when
+                // the request started until the commit completed.
+                if index > *commit_index && current_term == term {
                     let cmd = storage.get_command(index)?;
-                    let mut commit_index = self.commit_index.lock().await;
                     debug!(
                         "Increasing commit index to {} from {}",
                         index, *commit_index
@@ -847,7 +846,7 @@ impl<S: Storage> Leader<S> {
     }
 }
 
-pub struct Heartbeater<S: Storage, R: RPC> {
+pub struct Forwarder<S: Storage, R: RPC> {
     id: String,
     peer: Peer,
     heartbeat_interval: Duration,
@@ -861,7 +860,7 @@ pub struct Heartbeater<S: Storage, R: RPC> {
     rpc: R,
 }
 
-impl<S: Storage, R: RPC> Heartbeater<S, R> {
+impl<S: Storage, R: RPC> Forwarder<S, R> {
     pub fn new(
         id: String,
         peer: Peer,
@@ -873,17 +872,17 @@ impl<S: Storage, R: RPC> Heartbeater<S, R> {
         term_updates_tx: Sender<()>,
         rpc: R,
         next_index: usize,
-    ) -> Heartbeater<S, R> {
+    ) -> Forwarder<S, R> {
         // Raft is able to elect and maintain a steady leader as long as the system satisfies the
         // timing requirement
         //     broadcastTime << electionTimeout << MTBF
         // The broadcast time should be an order of magnitude less than the election timeout.
-        let heartbeat_interval = timeout.mul_f32(0.1);
+        let heartbeat_interval = timeout.mul_f32(0.2);
         // We should not wait indefinitely for an RPC call to complete; we may encounter a slow
         // follower, which needs more time to process the request. For this reason, wait an order
         // of magnitude longer than the election timeout.
-        let append_entries_timeout = timeout.mul_f32(10.0);
-        Heartbeater {
+        let append_entries_timeout = timeout.mul_f32(5.0);
+        Forwarder {
             id,
             peer,
             heartbeat_interval,
@@ -898,89 +897,97 @@ impl<S: Storage, R: RPC> Heartbeater<S, R> {
         }
     }
 
-    async fn run(&mut self) {
-        loop {
-            let mut max_index = None;
-            // Consume any built-up updates:
-            while let Ok(log) = self.new_logs_rx.try_recv() {
-                max_index = Some(log);
-            }
-            if max_index.is_none() {
-                let delay = tokio::time::delay_for(self.heartbeat_interval);
-                max_index = select! {
-                    _ = delay => None,
-                    log = self.new_logs_rx.recv() => match log {
-                        Ok(log) => Some(log),
-                        // If the sender hung up, we're no longer leader, and should not send heartbeats.
-                        Err(_) => return,
-                    },
-                };
-            }
+    pub async fn run(&mut self) {
+        while self.run_once().await {}
+    }
 
-            // Create the request data
-            let (request, current_term, max_index_sent) = match self.build_request(max_index).await
-            {
-                Ok(req) => req,
-                Err(e) => {
-                    error!("Failed to get data for AppendEntries request: {}", e);
-                    continue;
-                }
-            };
-            // Send the request
-            let response = self.rpc.append_entries(self.peer.address.clone(), request);
-            // Only wait for so long before we consider it a failure:
-            match tokio::time::timeout(self.append_entries_timeout, response).await {
-                Ok(Ok(resp)) => {
-                    if resp.term > current_term {
-                        info!("Peer {} is on a newer term {}", self.peer.id, resp.term);
-                        let mut storage = self.storage.lock().await;
-                        storage.set_current_term(resp.term).unwrap();
-                        storage.set_voted_for(None).unwrap();
-                        // Send the term update; if the send fails then the protocol has shutdown.
-                        let _ = self.term_updates_tx.send(()).await;
-                        return;
-                    } else if !resp.success {
-                        debug!(
-                            "Peer {} could not process log index {}",
-                            self.peer.id, self.next_index
-                        );
-                        if self.next_index > 1 {
-                            self.next_index -= 1;
-                        }
-                    } else {
-                        trace!("Peer {} processed AppendEntries successfully", self.peer.id);
-                        if let Some(max_index) = max_index_sent {
-                            self.next_index = max_index + 1;
-                            if self
-                                .match_index_tx
-                                .send((self.peer.id.clone(), max_index))
-                                .await
-                                .is_err()
-                            {
-                                // The leader is no longer listening for index updates.
-                                // We must be in a different state now
-                                return;
-                            }
-                        }
+    pub async fn run_once(&mut self) -> bool {
+        if let Err(_) = self.next_request().await {
+            debug!("Stopping forwarder {} because leadership hung up", self.id);
+            return false;
+        }
+        let request = match self.build_request().await {
+            Ok(req) => req,
+            Err(e) => {
+                error!("Failed to load data for AppendEntries request: {}", e);
+                return true;
+            }
+        };
+        let current_term = request.term;
+        let max_sent_index = request.entries.last().map(|l| l.index);
+
+        // Send the request
+        let response = self.rpc.append_entries(self.peer.address.clone(), request);
+        // Only wait for so long before we consider it a failure:
+        match tokio::time::timeout(self.append_entries_timeout, response).await {
+            Ok(Ok(resp)) => {
+                if resp.term > current_term {
+                    info!("Peer {} is on a newer term {}", self.peer.id, resp.term);
+                    let mut storage = self.storage.lock().await;
+                    storage.set_current_term(resp.term).unwrap();
+                    storage.set_voted_for(None).unwrap();
+                    // Send the term update; if the send fails then the protocol has shutdown.
+                    let _ = self.term_updates_tx.send(()).await;
+                    debug!(
+                        "Stopping forwarder {} because we received a newer term",
+                        self.peer
+                    );
+                    return false;
+                } else if !resp.success {
+                    debug!(
+                        "Peer {} could not process log index {}",
+                        self.peer, self.next_index
+                    );
+                    if self.next_index > 1 {
+                        self.next_index -= 1;
+                    }
+                } else if let Some(max_index) = max_sent_index {
+                    trace!(
+                        "Peer {} processed AppendEntries successfully to index {}",
+                        self.peer,
+                        max_index
+                    );
+                    self.next_index = max_index + 1;
+                    if self
+                        .match_index_tx
+                        .send((self.peer.id.clone(), max_index))
+                        .await
+                        .is_err()
+                    {
+                        debug!("Stopping forwarder {} because leadership hung up", self.id);
+                        return false;
                     }
                 }
-                Ok(Err(e)) => {
-                    error!(
-                        "Peer {} responded with error to AppendEntries: {}",
-                        self.peer.id, e
-                    );
-                }
-                Err(_) => {
-                    error!("Peer {} timed out on AppendEntries", self.peer.id);
-                }
             }
+            Ok(Err(e)) => {
+                error!(
+                    "Peer {} responded to AppendEntries with error: {}",
+                    self.peer, e
+                );
+            }
+            Err(_) => {
+                error!("AppendEntries to peer {} timed out", self.peer);
+            }
+        }
+        true
+    }
+
+    async fn next_request(&self) -> Result<(), RecvError> {
+        if let Ok(_) = self.new_logs_rx.try_recv() {
+            return Ok(());
+        }
+        // Wait for the next update request, or the next heartbeat interval, whichever is first.
+        // If the
+        if let Ok(Err(e)) =
+            tokio::time::timeout(self.heartbeat_interval, self.new_logs_rx.recv()).await
+        {
+            Err(e)
+        } else {
+            Ok(())
         }
     }
 
-    async fn build_request(
-        &mut self,
-        max_index: Option<usize>,
-    ) -> std::io::Result<(AppendEntriesRequest, usize, Option<usize>)> {
+    async fn build_request(&self) -> std::io::Result<AppendEntriesRequest> {
         let leader_commit = { *self.commit_index.lock().await };
         let storage = self.storage.lock().await;
         let term = storage.current_term()?;
@@ -989,31 +996,25 @@ impl<S: Storage, R: RPC> Heartbeater<S, R> {
             .get_term(prev_log_index)?
             .expect("log is missing entries!");
 
+        // Send up to 100 entries at a time.
         let mut entries = Vec::new();
-        if let Some(index) = max_index {
-            // Send up to 100 entries at a time
-            for index in (self.next_index..(index + 1)).take(100) {
-                let command = storage.get_command(index)?;
-                let term = storage.get_term(index)?.unwrap();
-                entries.push(LogEntry {
-                    index,
-                    term,
-                    command,
-                });
-            }
-        }
-        let max_sent_index = entries.iter().last().map(|l| l.index);
-        Ok((
-            AppendEntriesRequest {
-                leader_id: self.id.clone(),
+        let max_index = storage.last_index()?;
+        for index in (self.next_index..(max_index + 1)).take(100) {
+            let command = storage.get_command(index)?;
+            let term = storage.get_term(index)?.unwrap();
+            entries.push(LogEntry {
+                index,
                 term,
-                leader_commit,
-                prev_log_index,
-                prev_log_term,
-                entries,
-            },
+                command,
+            });
+        }
+        Ok(AppendEntriesRequest {
+            leader_id: self.id.clone(),
             term,
-            max_sent_index,
-        ))
+            leader_commit,
+            prev_log_index,
+            prev_log_term,
+            entries,
+        })
     }
 }
