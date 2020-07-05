@@ -1,5 +1,5 @@
 use crate::rpc::{AppendEntriesRequest, RPCBuilder, RaftServer, RequestVoteRequest, RPC};
-use crate::state::{Command, StateMachine, StateMachineApplier};
+use crate::state::{Command, StateMachine};
 use crate::storage::{LogCommand, LogEntry, Storage};
 use async_channel::{Receiver, RecvError, Sender, TryRecvError, TrySendError};
 use async_lock::Lock;
@@ -26,26 +26,34 @@ impl Display for Peer {
     }
 }
 
-pub async fn start<R, S, M>(
+pub async fn start<R, S>(
     id: String,
     peers: Vec<Peer>,
     timeout: Duration,
     rpc_config: R,
     storage: S,
-) -> Result<M, std::io::Error>
+) -> Result<(), std::io::Error>
 where
     R: RPCBuilder,
     S: Storage,
-    M: StateMachine<S>,
 {
     let storage = Lock::new(storage);
+    let state_machine = Lock::new(StateMachine::new());
+    let current_state = Lock::new(ProtocolState::Follower);
+    let last_applied_tx = Lock::new(Vec::new());
     let (commits_to_apply_tx, commits_to_apply_rx) = async_channel::bounded(1);
     let (append_entries_tx, append_entries_rx) = async_channel::bounded(1);
-    let (last_applied_tx, last_applied_rx) = async_channel::bounded(1);
     let (term_updates_tx, term_updates_rx) = async_channel::bounded(1);
     let (new_logs_tx, new_logs_rx) = async_channel::bounded(1);
 
-    let raft_server = RaftServer::new(storage.clone(), term_updates_tx.clone(), append_entries_tx);
+    let raft_server = RaftServer::new(
+        storage.clone(),
+        term_updates_tx.clone(),
+        append_entries_tx,
+        current_state.clone(),
+        new_logs_tx,
+        last_applied_tx,
+    );
 
     let rpc = rpc_config.build(raft_server)?;
 
@@ -54,6 +62,7 @@ where
         peers,
         timeout,
         storage.clone(),
+        current_state.clone(),
         rpc,
         term_updates_tx,
         term_updates_rx,
@@ -62,99 +71,13 @@ where
         new_logs_rx,
     );
 
-    let consensus = Consensus {
-        storage: storage.clone(),
-        current_state: tasks.current_state.clone(),
-        new_commands_tx: new_logs_tx,
-        last_applied_rx,
-    };
-
-    let (state_machine, applier) = M::build(consensus);
-
     tokio::spawn(async move {
-        let mut lc = LogCommitter::new(applier, commits_to_apply_rx, last_applied_tx);
+        let mut lc = LogCommitter::new(state_machine, commits_to_apply_rx, last_applied_tx);
         lc.run().await
     });
     tokio::spawn(async move { tasks.run().await });
 
-    Ok(state_machine)
-}
-
-pub struct Consensus<S: Storage> {
-    storage: Lock<S>,
-    current_state: Lock<ProtocolState>,
-    new_commands_tx: Sender<usize>,
-    last_applied_rx: Receiver<usize>,
-}
-
-#[derive(Debug)]
-pub enum ConsensusError {
-    NotLeader,
-    RaftProtocolTerminated,
-    SerializationError(Box<dyn std::error::Error + Send + Sync>),
-    StorageError(Box<dyn std::error::Error + Send + Sync>),
-}
-
-impl std::fmt::Display for ConsensusError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ConsensusError::NotLeader => write!(f, "This raft instance is not the leader"),
-            ConsensusError::RaftProtocolTerminated => {
-                write!(f, "The raft protocol has been terminated")
-            }
-            ConsensusError::SerializationError(e) => {
-                write!(f, "Error while serializing command: {}", e)
-            }
-            ConsensusError::StorageError(e) => {
-                write!(f, "Error while interacting with stable storage: {}", e)
-            }
-        }
-    }
-}
-
-impl std::error::Error for ConsensusError {}
-
-impl<S: Storage> Consensus<S> {
-    pub async fn commit<C: Command>(&mut self, cmd: C) -> Result<usize, ConsensusError> {
-        let index = self.send(cmd).await?;
-
-        while let Ok(last_applied) = self.last_applied_rx.recv().await {
-            if last_applied >= index {
-                return Ok(index);
-            }
-        }
-        Err(ConsensusError::RaftProtocolTerminated)
-    }
-
-    pub async fn send<C: Command>(&mut self, cmd: C) -> Result<usize, ConsensusError> {
-        let current_state = self.current_state.lock().await;
-        if let ProtocolState::Leader = *current_state {
-            return Err(ConsensusError::NotLeader);
-        }
-        let cmd = cmd
-            .serialize()
-            .map_err(|e| ConsensusError::SerializationError(Box::new(e)))?;
-        let command = LogCommand::Command(cmd);
-
-        let index = {
-            let mut storage = self.storage.lock().await;
-
-            let term = storage
-                .current_term()
-                .map_err(|e| ConsensusError::StorageError(Box::new(e)))?;
-
-            storage
-                .append_entry(term, command)
-                .map_err(|e| ConsensusError::StorageError(Box::new(e)))?
-        };
-
-        self.new_commands_tx
-            .send(index)
-            .await
-            .map_err(|_| ConsensusError::RaftProtocolTerminated)?;
-
-        Ok(index)
-    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -165,18 +88,18 @@ pub enum ProtocolState {
     Shutdown,
 }
 
-pub struct LogCommitter<SM: StateMachineApplier> {
+pub struct LogCommitter {
     commits: Receiver<(usize, LogCommand)>,
-    state_machine: SM,
-    last_applied_tx: Sender<usize>,
+    state_machine: Lock<StateMachine>,
+    last_applied_tx: Lock<Vec<Sender<usize>>>,
 }
 
-impl<SM: StateMachineApplier> LogCommitter<SM> {
+impl LogCommitter {
     fn new(
-        state_machine: SM,
+        state_machine: Lock<StateMachine>,
         commits: Receiver<(usize, LogCommand)>,
-        last_applied_tx: Sender<usize>,
-    ) -> LogCommitter<SM> {
+        last_applied_tx: Lock<Vec<Sender<usize>>>,
+    ) -> LogCommitter {
         LogCommitter {
             commits,
             state_machine,
@@ -212,10 +135,8 @@ impl<SM: StateMachineApplier> LogCommitter<SM> {
                 }
                 LogCommand::Noop => {}
             }
-            if let Err(_) = self.last_applied_tx.send(commit_index).await {
-                trace!("consensus struct has been dropped; closing log committer");
-                return;
-            }
+            let mut last_applied = self.last_applied_tx.lock().await;
+            last_applied.retain(|tx| tx.send(commit_index).await.is_err());
         }
     }
 }
@@ -264,6 +185,7 @@ impl<S: Storage, R: RPC> ProtocolTasks<S, R> {
         peers: Vec<Peer>,
         timeout: Duration,
         storage: Lock<S>,
+        current_state: Lock<ProtocolState>,
         rpc: R,
         term_updates_tx: Sender<()>,
         term_updates_rx: Receiver<()>,
@@ -271,7 +193,6 @@ impl<S: Storage, R: RPC> ProtocolTasks<S, R> {
         append_entries_rx: Receiver<usize>,
         new_logs_rx: Receiver<usize>,
     ) -> ProtocolTasks<S, R> {
-        let current_state = Lock::new(ProtocolState::Follower);
         let commit_index = Lock::new(0);
 
         ProtocolTasks {
@@ -877,7 +798,7 @@ impl<S: Storage, R: RPC> Forwarder<S, R> {
         // timing requirement
         //     broadcastTime << electionTimeout << MTBF
         // The broadcast time should be an order of magnitude less than the election timeout.
-        let heartbeat_interval = timeout.mul_f32(0.2);
+        let heartbeat_interval = timeout.mul_f32(0.5);
         // We should not wait indefinitely for an RPC call to complete; we may encounter a slow
         // follower, which needs more time to process the request. For this reason, wait an order
         // of magnitude longer than the election timeout.

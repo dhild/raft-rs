@@ -1,111 +1,115 @@
 use crate::storage::Storage;
-use crate::Consensus;
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 
-pub trait Command: Sized + Send + Sync + 'static {
-    type Error: std::error::Error + Sync + Send + Sized + 'static;
-    fn deserialize(data: &[u8]) -> Result<Self, Self::Error>;
-    fn serialize(&self) -> Result<Vec<u8>, Self::Error>;
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub enum Command {
+    #[cfg(feature = "kv-store")]
+    KV(KVCommand),
 }
 
-#[async_trait]
-pub trait StateMachineApplier: Send + Sync + 'static {
-    type Command: Command;
-
-    async fn apply(&self, index: usize, cmd: Self::Command);
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub enum Query {
+    #[cfg(feature = "kv-store")]
+    KV(KVQuery),
 }
 
-pub trait StateMachine<S: Storage>: Sized {
-    type Applier: StateMachineApplier;
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub enum QueryResponse {
+    None,
+    #[cfg(feature = "kv-store")]
+    KV(KVQueryResponse),
+}
 
-    fn build(consensus: Consensus<S>) -> (Self, Self::Applier);
+pub struct StateMachine {
+    #[cfg(feature = "kv-store")]
+    kv: kv::KeyValueStore,
+}
+
+impl Default for StateMachine {
+    fn default() -> Self {
+        StateMachine {
+            #[cfg(feature = "kv-store")]
+            kv: kv::KeyValueStore::default(),
+        }
+    }
+}
+
+impl StateMachine {
+    pub fn apply<C>(&mut self, cmd: C)
+    where
+        C: Into<Command>,
+    {
+        match cmd.into() {
+            #[cfg(feature = "kv-store")]
+            Command::KV(ref cmd) => self.kv.apply(cmd),
+        }
+    }
+
+    pub fn query<Q>(&self, query: Q) -> QueryResponse
+    where
+        Q: Into<Query>,
+    {
+        match query.into() {
+            #[cfg(feature = "kv-store")]
+            Query::KV(ref query) => QueryResponse::KV(self.kv.query(cmd)),
+        }
+    }
 }
 
 #[cfg(feature = "kv-store")]
-pub use kv::{KVCommand, KeyValueStore};
+pub use kv::{Command as KVCommand, Query as KVQuery, QueryResponse as KVResponse};
 
 #[cfg(feature = "kv-store")]
 mod kv {
-    use crate::error::Result;
-    use crate::state::{Command, StateMachineApplier};
-    use crate::storage::Storage;
-    use crate::{Consensus, StateMachine};
     use async_lock::Lock;
     use async_trait::async_trait;
     use bytes::Bytes;
     use serde::{Deserialize, Serialize};
     use std::collections::HashMap;
 
-    pub struct KeyValueStore<S: Storage> {
-        data: Lock<HashMap<String, Bytes>>,
-        consensus: Consensus<S>,
+    pub struct KeyValueStore {
+        data: HashMap<String, Bytes>,
     }
 
-    impl<S: Storage> KeyValueStore<S> {
-        pub async fn put(&mut self, key: &str, value: &[u8]) -> Result<usize> {
-            let index = self
-                .consensus
-                .commit(KVCommand::Put {
-                    key: key.into(),
-                    value: value.to_vec().into(),
-                })
-                .await?;
-            Ok(index)
-        }
-
-        pub async fn get(&self, key: &str) -> Option<Bytes> {
-            let data = self.data.lock().await;
-            data.get(key).cloned()
+    impl Default for KeyValueStore {
+        fn default() -> Self {
+            let data = HashMap::new();
+            KeyValueStore { data }
         }
     }
 
-    impl<S: Storage> StateMachine<S> for KeyValueStore<S> {
-        type Applier = KVApplier;
-
-        fn build(consensus: Consensus<S>) -> (Self, KVApplier) {
-            let lock = Lock::new(HashMap::new());
-            (
-                KeyValueStore {
-                    data: lock.clone(),
-                    consensus,
-                },
-                KVApplier { data: lock },
-            )
-        }
-    }
-
-    pub struct KVApplier {
-        data: Lock<HashMap<String, Bytes>>,
-    }
-
-    #[async_trait]
-    impl StateMachineApplier for KVApplier {
-        type Command = KVCommand;
-
-        async fn apply(&self, _index: usize, cmd: Self::Command) {
-            let mut data = self.data.lock().await;
+    impl KeyValueStore {
+        pub fn apply(&mut self, cmd: &Command) {
             match cmd {
-                KVCommand::Put { key, value } => {
-                    data.insert(key, value);
+                Command::Put { key, value } => {
+                    self.data.insert(key.to_string(), value.clone());
+                }
+            }
+        }
+
+        pub fn query(&self, query: &Query) -> QueryResponse {
+            match query {
+                Query::Get { key } => {
+                    let value = self.data.get(key).cloned();
+                    QueryResponse::Get { value }
                 }
             }
         }
     }
 
     #[derive(Serialize, Deserialize, Debug, Clone)]
-    pub enum KVCommand {
+    pub enum Command {
         Put { key: String, value: Bytes },
     }
 
-    impl Command for KVCommand {
-        type Error = serde_json::Error;
+    #[derive(Serialize, Deserialize, Debug, Clone)]
+    pub enum Query {
+        Get { key: String },
+    }
 
-        fn deserialize(data: &[u8]) -> std::result::Result<Self, Self::Error> {
-            serde_json::from_slice(data)
-        }
-
-        fn serialize(&self) -> std::result::Result<Vec<u8>, Self::Error> {
-            serde_json::to_vec(&self)
-        }
+    #[derive(Serialize, Deserialize, Debug, Clone)]
+    pub enum QueryResponse {
+        Get { value: Option<Bytes> },
     }
 }

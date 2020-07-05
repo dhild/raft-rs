@@ -2,8 +2,7 @@ use crate::protocol::{Candidate, Follower, Forwarder, Leader, Peer, ProtocolStat
 use crate::rpc::{
     AppendEntriesRequest, AppendEntriesResponse, RequestVoteRequest, RequestVoteResponse, RPC,
 };
-use crate::storage::{LogCommand, MemoryStorage};
-use crate::Storage;
+use crate::storage::{LogCommand, MemoryStorage, Storage};
 use async_channel::{Receiver, Sender, TryRecvError};
 use async_lock::Lock;
 use env_logger::Env;

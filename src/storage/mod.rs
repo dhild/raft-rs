@@ -9,7 +9,7 @@ pub struct LogEntry {
 
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
 pub enum LogCommand {
-    Command(Vec<u8>),
+    Command(crate::state::Commmand),
     Noop,
 }
 

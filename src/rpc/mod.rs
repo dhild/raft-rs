@@ -1,7 +1,10 @@
-use crate::storage::{LogEntry, Storage};
-use async_channel::Sender;
+use crate::protocol::ProtocolState;
+use crate::state::{Command, Query, QueryResponse};
+use crate::storage::{LogCommand, LogEntry, Storage};
+use async_channel::{Receiver, Sender};
 use async_lock::Lock;
 use async_trait::async_trait;
+use futures::io::Error;
 use log::{debug, error};
 use serde::{Deserialize, Serialize};
 use std::error::Error as StdError;
@@ -91,6 +94,9 @@ pub struct RaftServer<S: Storage> {
     storage: Lock<S>,
     term_updates: Sender<()>,
     append_entries_tx: Sender<usize>,
+    current_state: Lock<ProtocolState>,
+    new_logs_tx: Sender<usize>,
+    last_applied_tx: Lock<Vec<Sender<usize>>>,
 }
 
 impl<S: Storage> RaftServer<S> {
@@ -98,11 +104,17 @@ impl<S: Storage> RaftServer<S> {
         storage: Lock<S>,
         term_updates: Sender<()>,
         append_entries_tx: Sender<usize>,
+        current_state: Lock<ProtocolState>,
+        new_logs_tx: Sender<usize>,
+        last_applied_tx: Lock<Vec<Sender<usize>>>,
     ) -> RaftServer<S> {
         RaftServer {
             storage,
             term_updates,
             append_entries_tx,
+            current_state,
+            new_logs_tx,
+            last_applied_tx,
         }
     }
 
@@ -210,6 +222,79 @@ impl<S: Storage> RaftServer<S> {
             }
         }
         Ok(RequestVoteResponse::failed(current_term))
+    }
+
+    pub async fn command(&self, cmd: Command) -> Result<(), RaftServerError> {
+        {
+            match *self.current_state.lock().await {
+                ProtocolState::Leader => (),
+                ProtocolState::Shutdown => Err(RaftServerError::RaftProtocolTerminated),
+                // TODO: Add leader address to this response
+                _ => Err(RaftServerError::NotLeader),
+            }
+        }
+        let command = LogCommand::Command(cmd);
+
+        let index = {
+            let mut storage = self.storage.lock().await;
+
+            let term = storage.current_term()?;
+
+            storage.append_entry(term, command)?
+        };
+
+        let (tx, rx) = async_channel::bounded(0);
+        {
+            let mut vec = self.last_applied_tx.lock().await;
+            vec.push(tx);
+        }
+
+        self.new_commands_tx
+            .send(index)
+            .await
+            .map_err(|_| RaftServerError::RaftProtocolTerminated)?;
+
+        while let Ok(last_applied) = rx.recv().await {
+            if last_applied >= index {
+                return Ok(());
+            }
+        }
+        Err(RaftServerError::RaftProtocolTerminated)
+    }
+
+    pub async fn query(&self, query: Query) -> Result<QueryResponse, RaftServerError> {
+        // Send heartbeat
+        // After majority responds, query state machine
+        unimplemented!()
+    }
+}
+
+#[derive(Debug)]
+pub enum RaftServerError {
+    NotLeader,
+    RaftProtocolTerminated,
+    StorageError(std::io::Error),
+}
+
+impl std::fmt::Display for RaftServerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RaftServerError::NotLeader => write!(f, "This raft instance is not the leader"),
+            RaftServerError::RaftProtocolTerminated => {
+                write!(f, "The raft protocol has been terminated")
+            }
+            RaftServerError::StorageError(e) => {
+                write!(f, "Error while interacting with stable storage: {}", e)
+            }
+        }
+    }
+}
+
+impl std::error::Error for RaftServerError {}
+
+impl From<std::io::Error> for RaftServerError {
+    fn from(e: std::io::Error) -> Self {
+        RaftServerError::StorageError(e)
     }
 }
 
