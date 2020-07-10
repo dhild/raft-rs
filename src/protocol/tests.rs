@@ -1,4 +1,6 @@
-use crate::protocol::{Candidate, Follower, Forwarder, Leader, Peer, ProtocolState};
+use crate::protocol::{
+    Candidate, Follower, Forwarder, Leader, Peer, ProtocolState, RaftConfiguration,
+};
 use crate::rpc::{
     AppendEntriesRequest, AppendEntriesResponse, RequestVoteRequest, RequestVoteResponse, RPC,
 };
@@ -243,7 +245,6 @@ impl RPC for TestRPC {
 
 struct CandidateTest {
     term_updates_tx: Sender<()>,
-    rpc: TestRPC,
     peer1: TestRPCPeer,
     peer2: TestRPCPeer,
     candidate: Candidate<MemoryStorage, TestRPC>,
@@ -256,17 +257,21 @@ impl CandidateTest {
         let mut rpc = TestRPC::new();
         let peer1 = rpc.add_peer("peer1");
         let peer2 = rpc.add_peer("peer2");
+        let id = "test-candidate".to_string();
         let candidate = Candidate::new(
-            "test-candidate".to_string(),
+            id.clone(),
+            Lock::new(RaftConfiguration::new(
+                id.clone(),
+                id.clone(),
+                vec![peer1.peer.clone(), peer2.peer.clone()],
+            )),
             Duration::from_millis(TEST_TIMEOUT_MS),
-            vec![peer1.peer.clone(), peer2.peer.clone()],
             Lock::new(MemoryStorage::new()),
             rpc.clone(),
             term_updates_rx,
         );
         CandidateTest {
             term_updates_tx,
-            rpc,
             peer1,
             peer2,
             candidate,
@@ -377,18 +382,22 @@ impl LeaderTest {
         let storage = Lock::new(MemoryStorage::new());
 
         let leader = Leader::new(
-            vec![
-                Peer {
-                    id: "peer1".to_string(),
-                    address: "peer1".to_string(),
-                    voting: true,
-                },
-                Peer {
-                    id: "peer2".to_string(),
-                    address: "peer2".to_string(),
-                    voting: true,
-                },
-            ],
+            Lock::new(RaftConfiguration::new(
+                "leader-id".to_string(),
+                "leader-addr".to_string(),
+                vec![
+                    Peer {
+                        id: "peer1".to_string(),
+                        address: "peer1".to_string(),
+                        voting: true,
+                    },
+                    Peer {
+                        id: "peer2".to_string(),
+                        address: "peer2".to_string(),
+                        voting: true,
+                    },
+                ],
+            )),
             storage.clone(),
             Lock::new(0),
             term_updates_rx,
@@ -541,10 +550,9 @@ async fn leader_rpc_shutdown_consensus() {
 
 struct ForwarderTest {
     storage: Lock<MemoryStorage>,
-    term_updates_rx: Receiver<()>,
+    _term_updates_rx: Receiver<()>,
     match_index_rx: Receiver<(String, usize)>,
     new_logs_tx: Sender<usize>,
-    rpc: TestRPC,
     peer: TestRPCPeer,
     forwarder: Forwarder<MemoryStorage, TestRPC>,
 }
@@ -574,10 +582,9 @@ impl ForwarderTest {
         );
         ForwarderTest {
             storage,
-            term_updates_rx,
+            _term_updates_rx: term_updates_rx,
             match_index_rx,
             new_logs_tx,
-            rpc,
             peer,
             forwarder,
         }
@@ -607,9 +614,7 @@ async fn forwarder_sends_logs() {
 
     {
         let mut storage = f.storage.lock().await;
-        storage
-            .append_entry(1, LogCommand::Command(b"foo".to_vec()))
-            .unwrap();
+        storage.append_entry(1, LogCommand::Noop).unwrap();
     }
 
     f.new_logs_tx.send(1).await.unwrap();
@@ -621,16 +626,11 @@ async fn forwarder_sends_logs() {
     assert_eq!(request.entries.len(), 1);
     assert_eq!(request.entries.get(0).unwrap().term, 1);
     assert_eq!(request.entries.get(0).unwrap().index, 1);
-    assert_eq!(
-        request.entries.get(0).unwrap().command,
-        LogCommand::Command(b"foo".to_vec())
-    );
+    assert_eq!(request.entries.get(0).unwrap().command, LogCommand::Noop);
 
     {
         let mut storage = f.storage.lock().await;
-        storage
-            .append_entry(1, LogCommand::Command(b"bar".to_vec()))
-            .unwrap();
+        storage.append_entry(1, LogCommand::Noop).unwrap();
     }
 
     f.peer.clear_request_queues();

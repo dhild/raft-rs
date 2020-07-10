@@ -19,11 +19,19 @@ impl MemoryStorage {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct MemoryConfig {}
+pub struct MemoryConfig {
+    pub term: Option<usize>,
+    pub voted_for: Option<String>,
+    pub entries: Option<Vec<LogEntry>>,
+}
 
 impl From<&MemoryConfig> for MemoryStorage {
-    fn from(_config: &MemoryConfig) -> Self {
-        MemoryStorage::new()
+    fn from(config: &MemoryConfig) -> Self {
+        MemoryStorage {
+            current_term: config.term.unwrap_or(0),
+            voted_for: config.voted_for.clone(),
+            entries: config.entries.clone().unwrap_or_default(),
+        }
     }
 }
 
@@ -93,8 +101,7 @@ impl Storage for MemoryStorage {
 
 #[cfg(test)]
 mod tests {
-    use crate::storage::{LogCommand, MemoryStorage};
-    use crate::Storage;
+    use crate::storage::{LogCommand, MemoryStorage, Storage};
 
     #[test]
     fn append_entries() {

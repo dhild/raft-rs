@@ -1,11 +1,10 @@
-use crate::protocol::ProtocolState;
-use crate::state::{Command, Query, QueryResponse};
+use crate::protocol::{ProtocolState, RaftConfiguration};
+use crate::state::{Command, Query, QueryResponse, StateMachine};
 use crate::storage::{LogCommand, LogEntry, Storage};
-use async_channel::{Receiver, Sender};
+use async_channel::Sender;
 use async_lock::Lock;
 use async_trait::async_trait;
-use futures::io::Error;
-use log::{debug, error};
+use log::{debug, error, info};
 use serde::{Deserialize, Serialize};
 use std::error::Error as StdError;
 
@@ -69,6 +68,18 @@ impl RequestVoteResponse {
     }
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ClientApplyResponse {
+    pub leader_address: Option<String>,
+    pub success: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ClientQueryResponse {
+    pub leader_address: Option<String>,
+    pub response: Option<QueryResponse>,
+}
+
 pub trait RPCBuilder {
     type RPC: RPC;
     fn build<S: Storage>(&self, server: RaftServer<S>) -> std::io::Result<Self::RPC>;
@@ -91,30 +102,36 @@ pub trait RPC: Clone + Send + Sync + 'static {
 
 #[derive(Clone)]
 pub struct RaftServer<S: Storage> {
+    configuration: Lock<RaftConfiguration>,
     storage: Lock<S>,
     term_updates: Sender<()>,
     append_entries_tx: Sender<usize>,
     current_state: Lock<ProtocolState>,
     new_logs_tx: Sender<usize>,
     last_applied_tx: Lock<Vec<Sender<usize>>>,
+    state_machine: Lock<StateMachine>,
 }
 
 impl<S: Storage> RaftServer<S> {
     pub fn new(
+        configuration: Lock<RaftConfiguration>,
         storage: Lock<S>,
         term_updates: Sender<()>,
         append_entries_tx: Sender<usize>,
         current_state: Lock<ProtocolState>,
         new_logs_tx: Sender<usize>,
         last_applied_tx: Lock<Vec<Sender<usize>>>,
+        state_machine: Lock<StateMachine>,
     ) -> RaftServer<S> {
         RaftServer {
+            configuration,
             storage,
             term_updates,
             append_entries_tx,
             current_state,
             new_logs_tx,
             last_applied_tx,
+            state_machine,
         }
     }
 
@@ -138,6 +155,19 @@ impl<S: Storage> RaftServer<S> {
         if req.term < current_term {
             return Ok(AppendEntriesResponse::failed(current_term));
         }
+        // Update the current leader:
+        {
+            let mut configuration = self.configuration.lock().await;
+            if !configuration.is_current_leader(&req.leader_id) {
+                info!(
+                    "Updating local leader to point to the current leader {}",
+                    req.leader_id
+                );
+
+                configuration.set_current_leader(&req.leader_id);
+            }
+        }
+
         // Ensure our previous entries match
         if let Some(term) = storage.get_term(req.prev_log_index)? {
             if term != req.prev_log_term {
@@ -163,6 +193,7 @@ impl<S: Storage> RaftServer<S> {
                 index = e.index;
             }
         }
+        drop(storage);
 
         // Update the commit index with the latest committed value in our logs
         if self
@@ -205,7 +236,7 @@ impl<S: Storage> RaftServer<S> {
         // Make sure we didn't vote for a different candidate already
         if storage
             .voted_for()?
-            .map(|c| &c == &req.candidate_id)
+            .map(|c| c == req.candidate_id)
             .unwrap_or(true)
         {
             // Grant the vote as long as their log is up to date.
@@ -224,13 +255,19 @@ impl<S: Storage> RaftServer<S> {
         Ok(RequestVoteResponse::failed(current_term))
     }
 
-    pub async fn command(&self, cmd: Command) -> Result<(), RaftServerError> {
+    pub async fn apply(&self, cmd: Command) -> Result<ClientApplyResponse, RaftServerError> {
         {
             match *self.current_state.lock().await {
                 ProtocolState::Leader => (),
-                ProtocolState::Shutdown => Err(RaftServerError::RaftProtocolTerminated),
-                // TODO: Add leader address to this response
-                _ => Err(RaftServerError::NotLeader),
+                ProtocolState::Shutdown => return Err(RaftServerError::RaftProtocolTerminated),
+                ProtocolState::Candidate | ProtocolState::Follower => {
+                    let leader_address = self.configuration.lock().await.current_leader_address();
+                    debug!("Not leader, responding to apply with {:?}", leader_address);
+                    return Ok(ClientApplyResponse {
+                        leader_address,
+                        success: false,
+                    });
+                }
             }
         }
         let command = LogCommand::Command(cmd);
@@ -243,35 +280,58 @@ impl<S: Storage> RaftServer<S> {
             storage.append_entry(term, command)?
         };
 
-        let (tx, rx) = async_channel::bounded(0);
+        let (tx, rx) = async_channel::bounded(1);
         {
             let mut vec = self.last_applied_tx.lock().await;
             vec.push(tx);
         }
 
-        self.new_commands_tx
+        self.new_logs_tx
             .send(index)
             .await
             .map_err(|_| RaftServerError::RaftProtocolTerminated)?;
 
         while let Ok(last_applied) = rx.recv().await {
             if last_applied >= index {
-                return Ok(());
+                let leader_address = self.configuration.lock().await.current_leader_address();
+                return Ok(ClientApplyResponse {
+                    leader_address,
+                    success: true,
+                });
             }
         }
         Err(RaftServerError::RaftProtocolTerminated)
     }
 
-    pub async fn query(&self, query: Query) -> Result<QueryResponse, RaftServerError> {
-        // Send heartbeat
+    pub async fn query(&self, query: Query) -> Result<ClientQueryResponse, RaftServerError> {
+        {
+            match *self.current_state.lock().await {
+                ProtocolState::Leader => (),
+                ProtocolState::Shutdown => return Err(RaftServerError::RaftProtocolTerminated),
+                ProtocolState::Candidate | ProtocolState::Follower => {
+                    let leader_address = self.configuration.lock().await.current_leader_address();
+                    return Ok(ClientQueryResponse {
+                        leader_address,
+                        response: None,
+                    });
+                }
+            }
+        }
+        // TODO: Send heartbeat, wait for majority to respond
         // After majority responds, query state machine
-        unimplemented!()
+
+        let leader_address = { self.configuration.lock().await.current_leader_address() };
+        let state_machine = self.state_machine.lock().await;
+        let response = state_machine.query(query);
+        Ok(ClientQueryResponse {
+            leader_address,
+            response: Some(response),
+        })
     }
 }
 
 #[derive(Debug)]
 pub enum RaftServerError {
-    NotLeader,
     RaftProtocolTerminated,
     StorageError(std::io::Error),
 }
@@ -279,7 +339,6 @@ pub enum RaftServerError {
 impl std::fmt::Display for RaftServerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            RaftServerError::NotLeader => write!(f, "This raft instance is not the leader"),
             RaftServerError::RaftProtocolTerminated => {
                 write!(f, "The raft protocol has been terminated")
             }
@@ -302,4 +361,4 @@ impl From<std::io::Error> for RaftServerError {
 mod http;
 
 #[cfg(feature = "http-rpc")]
-pub use http::{HttpConfig, HttpRPC};
+pub use http::{HttpClient, HttpClientConfig, HttpConfig, HttpRPC};

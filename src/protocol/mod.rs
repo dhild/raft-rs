@@ -1,5 +1,5 @@
 use crate::rpc::{AppendEntriesRequest, RPCBuilder, RaftServer, RequestVoteRequest, RPC};
-use crate::state::{Command, StateMachine};
+use crate::state::StateMachine;
 use crate::storage::{LogCommand, LogEntry, Storage};
 use async_channel::{Receiver, RecvError, Sender, TryRecvError, TrySendError};
 use async_lock::Lock;
@@ -13,7 +13,68 @@ use tokio::select;
 #[cfg(test)]
 mod tests;
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
+pub struct RaftConfiguration {
+    id: String,
+    address: String,
+    peers: Vec<Peer>,
+    current_leader: Option<String>,
+}
+
+impl RaftConfiguration {
+    pub fn new(id: String, address: String, peers: Vec<Peer>) -> RaftConfiguration {
+        RaftConfiguration {
+            id,
+            address,
+            peers,
+            current_leader: None,
+        }
+    }
+
+    pub fn peers(&self) -> Vec<Peer> {
+        self.peers.clone()
+    }
+
+    pub fn current_leader_address(&self) -> Option<String> {
+        self.current_leader
+            .as_ref()
+            .map(|id| {
+                self.peers
+                    .iter()
+                    .find(|peer| &peer.id == id)
+                    .map(|peer| peer.address.clone())
+            })
+            .unwrap_or(None)
+    }
+
+    pub fn is_current_leader(&self, leader_id: &str) -> bool {
+        self.current_leader
+            .as_ref()
+            .map(|id| id == leader_id)
+            .unwrap_or(false)
+    }
+
+    pub fn set_current_leader(&mut self, leader_id: &str) {
+        self.current_leader = Some(leader_id.to_string());
+    }
+
+    pub fn voting_majority(&self) -> Option<usize> {
+        match self.peers.iter().filter(|p| p.voting).count() {
+            0 => {
+                error!("Must have at least one voting peer to create a voting majority");
+                None
+            }
+            1 | 2 => Some(2),
+            3 | 4 => Some(3),
+            x => {
+                error!("Too many voting peers (found {})", x);
+                None
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct Peer {
     pub id: String,
     pub address: String,
@@ -28,6 +89,7 @@ impl Display for Peer {
 
 pub async fn start<R, S>(
     id: String,
+    address: String,
     peers: Vec<Peer>,
     timeout: Duration,
     rpc_config: R,
@@ -37,8 +99,9 @@ where
     R: RPCBuilder,
     S: Storage,
 {
+    let configuration = Lock::new(RaftConfiguration::new(id.clone(), address, peers));
     let storage = Lock::new(storage);
-    let state_machine = Lock::new(StateMachine::new());
+    let state_machine = Lock::new(StateMachine::default());
     let current_state = Lock::new(ProtocolState::Follower);
     let last_applied_tx = Lock::new(Vec::new());
     let (commits_to_apply_tx, commits_to_apply_rx) = async_channel::bounded(1);
@@ -47,22 +110,24 @@ where
     let (new_logs_tx, new_logs_rx) = async_channel::bounded(1);
 
     let raft_server = RaftServer::new(
+        configuration.clone(),
         storage.clone(),
         term_updates_tx.clone(),
         append_entries_tx,
         current_state.clone(),
         new_logs_tx,
-        last_applied_tx,
+        last_applied_tx.clone(),
+        state_machine.clone(),
     );
 
     let rpc = rpc_config.build(raft_server)?;
 
     let mut tasks = ProtocolTasks::new(
         id,
-        peers,
+        configuration,
         timeout,
-        storage.clone(),
-        current_state.clone(),
+        storage,
+        current_state,
         rpc,
         term_updates_tx,
         term_updates_rx,
@@ -72,10 +137,16 @@ where
     );
 
     tokio::spawn(async move {
+        debug!("Starting log committer task");
         let mut lc = LogCommitter::new(state_machine, commits_to_apply_rx, last_applied_tx);
-        lc.run().await
+        lc.run().await;
+        debug!("Closing log committer task");
     });
-    tokio::spawn(async move { tasks.run().await });
+    tokio::spawn(async move {
+        debug!("Starting raft protocol task");
+        tasks.run().await;
+        debug!("Closing raft protocol task");
+    });
 
     Ok(())
 }
@@ -86,6 +157,17 @@ pub enum ProtocolState {
     Candidate,
     Leader,
     Shutdown,
+}
+
+impl fmt::Display for ProtocolState {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            ProtocolState::Follower => write!(f, "Follower"),
+            ProtocolState::Candidate => write!(f, "Candidate"),
+            ProtocolState::Leader => write!(f, "Leader"),
+            ProtocolState::Shutdown => write!(f, "Shutdown"),
+        }
+    }
 }
 
 pub struct LogCommitter {
@@ -120,54 +202,25 @@ impl LogCommitter {
             }
             last_applied = commit_index;
             match cmd {
-                LogCommand::Command(ref data) => {
-                    let cmd = match SM::Command::deserialize(data) {
-                        Ok(cmd) => cmd,
-                        Err(e) => {
-                            error!(
-                                "Could not deserialize command at index {}: {}",
-                                commit_index, e
-                            );
-                            return; // Triggers a graceful shutdown
-                        }
-                    };
-                    self.state_machine.apply(commit_index, cmd).await
-                }
+                LogCommand::Command(cmd) => self.state_machine.lock().await.apply(cmd),
                 LogCommand::Noop => {}
             }
             let mut last_applied = self.last_applied_tx.lock().await;
-            last_applied.retain(|tx| tx.send(commit_index).await.is_err());
+            let mut preserved = Vec::new();
+            for tx in last_applied.iter() {
+                if tx.send(commit_index).await.is_ok() {
+                    preserved.push(tx.clone());
+                }
+            }
+            *last_applied = preserved;
         }
     }
 }
-
-#[derive(Debug)]
-pub enum ProtocolError {
-    NotLeader,
-    RaftProtocolTerminated,
-    StorageError(std::io::Error),
-}
-
-impl std::fmt::Display for ProtocolError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ProtocolError::NotLeader => write!(f, "This raft instance is not the leader"),
-            ProtocolError::RaftProtocolTerminated => {
-                write!(f, "The raft protocol has been terminated")
-            }
-            ProtocolError::StorageError(e) => {
-                write!(f, "Error while interacting with stable storage: {}", e)
-            }
-        }
-    }
-}
-
-impl std::error::Error for ProtocolError {}
 
 pub struct ProtocolTasks<S: Storage, R: RPC> {
     id: String,
+    configuration: Lock<RaftConfiguration>,
     timeout: Duration,
-    peers: Vec<Peer>,
     storage: Lock<S>,
     rpc: R,
     commit_index: Lock<usize>,
@@ -182,7 +235,7 @@ pub struct ProtocolTasks<S: Storage, R: RPC> {
 impl<S: Storage, R: RPC> ProtocolTasks<S, R> {
     fn new(
         id: String,
-        peers: Vec<Peer>,
+        configuration: Lock<RaftConfiguration>,
         timeout: Duration,
         storage: Lock<S>,
         current_state: Lock<ProtocolState>,
@@ -197,7 +250,7 @@ impl<S: Storage, R: RPC> ProtocolTasks<S, R> {
 
         ProtocolTasks {
             id,
-            peers,
+            configuration,
             timeout,
             storage,
             rpc,
@@ -215,10 +268,11 @@ impl<S: Storage, R: RPC> ProtocolTasks<S, R> {
         loop {
             // Grab the current state and run the appropriate protocol logic.
             let state = { *self.current_state.lock().await };
+            trace!("Running raft protocol as {}", state);
             let state = match state {
-                ProtocolState::Follower => self.run_follower().await,
-                ProtocolState::Candidate => self.run_candidate().await,
-                ProtocolState::Leader => self.run_leader().await,
+                ProtocolState::Follower { .. } => self.run_follower().await,
+                ProtocolState::Candidate { .. } => self.run_candidate().await,
+                ProtocolState::Leader { .. } => self.run_leader().await,
                 ProtocolState::Shutdown => return,
             };
             // Update the state with any changes
@@ -243,8 +297,8 @@ impl<S: Storage, R: RPC> ProtocolTasks<S, R> {
     async fn run_candidate(&mut self) -> ProtocolState {
         let candidate = Candidate::new(
             self.id.clone(),
+            self.configuration.clone(),
             self.timeout,
-            self.peers.clone(),
             self.storage.clone(),
             self.rpc.clone(),
             self.term_updates_rx.clone(),
@@ -255,8 +309,8 @@ impl<S: Storage, R: RPC> ProtocolTasks<S, R> {
     async fn run_leader(&mut self) -> ProtocolState {
         let mut leader = match Leader::start(
             self.id.clone(),
+            self.configuration.clone(),
             self.timeout,
-            self.peers.clone(),
             self.storage.clone(),
             self.rpc.clone(),
             self.commit_index.clone(),
@@ -309,7 +363,7 @@ impl<S: Storage> Follower<S> {
     pub async fn run(&self) -> ProtocolState {
         loop {
             match self.run_once().await {
-                ProtocolState::Follower => {}
+                ProtocolState::Follower { .. } => {}
                 other => return other,
             }
         }
@@ -342,7 +396,12 @@ impl<S: Storage> Follower<S> {
         while new_commit_index > *commit_index {
             *commit_index += 1;
             let cmd = storage.get_command(*commit_index).unwrap();
-            if let Err(_) = self.commits_to_apply_tx.send((*commit_index, cmd)).await {
+            if self
+                .commits_to_apply_tx
+                .send((*commit_index, cmd))
+                .await
+                .is_err()
+            {
                 debug!("State machine processing has been disconnected; shutting down");
                 return ProtocolState::Shutdown;
             }
@@ -353,8 +412,8 @@ impl<S: Storage> Follower<S> {
 
 pub struct Candidate<S: Storage, R: RPC> {
     id: String,
+    configuration: Lock<RaftConfiguration>,
     timeout: Duration,
-    peers: Vec<Peer>,
     storage: Lock<S>,
     rpc: R,
     term_updates_rx: Receiver<()>,
@@ -363,8 +422,8 @@ pub struct Candidate<S: Storage, R: RPC> {
 impl<S: Storage, R: RPC> Candidate<S, R> {
     pub fn new(
         id: String,
+        configuration: Lock<RaftConfiguration>,
         timeout: Duration,
-        peers: Vec<Peer>,
         storage: Lock<S>,
         rpc: R,
         term_updates_rx: Receiver<()>,
@@ -372,8 +431,8 @@ impl<S: Storage, R: RPC> Candidate<S, R> {
         let timeout = timeout.mul_f32(1. + 2. * rand::thread_rng().gen::<f32>());
         Candidate {
             id,
+            configuration,
             timeout,
-            peers,
             storage,
             rpc,
             term_updates_rx,
@@ -384,7 +443,7 @@ impl<S: Storage, R: RPC> Candidate<S, R> {
         loop {
             let election_timeout = tokio::time::delay_for(self.timeout);
             match self.run_once().await {
-                ProtocolState::Candidate => {}
+                ProtocolState::Candidate { .. } => {}
                 other => return other,
             }
             // If the election fails quickly, make sure we wait out the timer.
@@ -437,8 +496,8 @@ impl<S: Storage, R: RPC> Candidate<S, R> {
         info!("Starting election for term {}", current_term);
 
         // Send out the RequestVote RPC calls.
-        let (votes_tx, votes_rx) = async_channel::bounded(self.peers.len());
-        for peer in self.peers.clone() {
+        let (votes_tx, votes_rx) = async_channel::bounded(5);
+        for peer in self.configuration.lock().await.peers() {
             let request = request.clone();
             let votes_tx = votes_tx.clone();
             let current_term = request.term;
@@ -468,7 +527,7 @@ impl<S: Storage, R: RPC> Candidate<S, R> {
                         ElectionResult::NotWinner
                     }
                 };
-                if let Err(_) = votes_tx.send(vote).await {
+                if votes_tx.send(vote).await.is_err() {
                     debug!(
                         "Term {} has already been tallied, not counting peer {}",
                         current_term, peer
@@ -488,7 +547,7 @@ impl<S: Storage, R: RPC> Candidate<S, R> {
         // If we end up with an outdated term, update the stored term data and drop to being a follower.
         // If we don't win enough votes, remain a candidate.
         // If we win a majority of votes, promote to being the leader.
-        let majority = match self.voting_majority() {
+        let majority = match self.configuration.lock().await.voting_majority() {
             Some(majority) => majority,
             None => {
                 info!("There cannot be a voting majority; dropping to follower state");
@@ -528,21 +587,6 @@ impl<S: Storage, R: RPC> Candidate<S, R> {
         );
         ProtocolState::Candidate
     }
-
-    fn voting_majority(&self) -> Option<usize> {
-        match self.peers.iter().filter(|p| p.voting).count() {
-            0 => {
-                error!("Must have at least one voting peer to create a voting majority");
-                None
-            }
-            1 | 2 => Some(2),
-            3 | 4 => Some(3),
-            x => {
-                error!("Too many voting peers (found {})", x);
-                None
-            }
-        }
-    }
 }
 
 enum ElectionResult {
@@ -552,7 +596,7 @@ enum ElectionResult {
 }
 
 pub struct Leader<S: Storage> {
-    peers: Vec<Peer>,
+    configuration: Lock<RaftConfiguration>,
     storage: Lock<S>,
     commit_index: Lock<usize>,
     term_updates_rx: Receiver<()>,
@@ -566,8 +610,8 @@ pub struct Leader<S: Storage> {
 impl<S: Storage> Leader<S> {
     pub async fn start<R: RPC>(
         id: String,
+        configuration: Lock<RaftConfiguration>,
         timeout: Duration,
-        peers: Vec<Peer>,
         storage: Lock<S>,
         rpc: R,
         commit_index: Lock<usize>,
@@ -577,16 +621,16 @@ impl<S: Storage> Leader<S> {
         new_logs_rx: Receiver<usize>,
     ) -> std::io::Result<Leader<S>> {
         let timeout = timeout.mul_f32(0.5);
-        let (index_update_tx, index_update_rx) = async_channel::bounded(peers.len());
+        let (index_update_tx, index_update_rx) = async_channel::bounded(15);
         let mut forward_updates = Vec::new();
         let next_index = { storage.lock().await.last_index()? + 1 };
-        for peer in peers.iter() {
+        for peer in configuration.lock().await.peers() {
             let (hb_tx, hb_rx) = async_channel::bounded(1);
             forward_updates.push(hb_tx);
 
             let mut hb = Forwarder::new(
                 id.clone(),
-                peer.clone(),
+                peer,
                 timeout,
                 index_update_tx.clone(),
                 storage.clone(),
@@ -599,7 +643,7 @@ impl<S: Storage> Leader<S> {
             tokio::spawn(async move { hb.run().await });
         }
         Ok(Leader::new(
-            peers,
+            configuration,
             storage,
             commit_index,
             term_updates_rx,
@@ -611,7 +655,7 @@ impl<S: Storage> Leader<S> {
     }
 
     pub fn new(
-        peers: Vec<Peer>,
+        configuration: Lock<RaftConfiguration>,
         storage: Lock<S>,
         commit_index: Lock<usize>,
         term_updates_rx: Receiver<()>,
@@ -621,7 +665,7 @@ impl<S: Storage> Leader<S> {
         forward_updates: Vec<Sender<usize>>,
     ) -> Leader<S> {
         Leader {
-            peers,
+            configuration,
             storage,
             commit_index,
             term_updates_rx,
@@ -679,7 +723,7 @@ impl<S: Storage> Leader<S> {
         self.match_index.insert(peer_id, index);
 
         match self.update_commit_index(index).await {
-            Ok(state) => return state,
+            Ok(state) => state,
             Err(e) => {
                 error!("Failed to update current commit index: {}", e);
                 ProtocolState::Follower
@@ -690,17 +734,23 @@ impl<S: Storage> Leader<S> {
     async fn update_commit_index(&self, index: usize) -> std::io::Result<ProtocolState> {
         // Find the number of voting peers that have this new index value or greater.
         // Add one to that count for ourselves; the matched index is always on the leader.
+        let configuration = self.configuration.lock().await;
         let updated = self
             .match_index
             .iter()
             .filter(|(_, i)| **i >= index)
-            .filter(|(peer_id, _)| self.peers.iter().any(|p| &p.id == *peer_id && p.voting))
+            .filter(|(peer_id, _)| {
+                configuration
+                    .peers
+                    .iter()
+                    .any(|p| &p.id == *peer_id && p.voting)
+            })
             .count()
             + 1;
 
         // See if there are enough with the log persisted to consider it committed
-        if self
-            .commit_majority()
+        if configuration
+            .voting_majority()
             .map(|majority| updated < majority)
             .unwrap_or(true)
         {
@@ -723,7 +773,7 @@ impl<S: Storage> Leader<S> {
                         index, *commit_index
                     );
                     *commit_index = index;
-                    if let Err(_) = self.commits_to_apply_tx.send((index, cmd)).await {
+                    if self.commits_to_apply_tx.send((index, cmd)).await.is_err() {
                         trace!("State machine processing disconnected; shutting down");
                         return Ok(ProtocolState::Shutdown);
                     }
@@ -741,27 +791,6 @@ impl<S: Storage> Leader<S> {
                     index
                 );
                 Ok(ProtocolState::Follower)
-            }
-        }
-    }
-
-    fn commit_majority(&self) -> Option<usize> {
-        // Count the number of voting peers:
-        match self
-            .peers
-            .iter()
-            .filter(|peer| self.peers.iter().any(|p| p.id == peer.id && p.voting))
-            .count()
-        {
-            0 => {
-                error!("Must have at least one voting peer to create a voting majority");
-                None
-            }
-            1 | 2 => Some(2),
-            3 | 4 => Some(3),
-            x => {
-                error!("Too many voting peers (found {})", x);
-                None
             }
         }
     }
@@ -823,7 +852,7 @@ impl<S: Storage, R: RPC> Forwarder<S, R> {
     }
 
     pub async fn run_once(&mut self) -> bool {
-        if let Err(_) = self.next_request().await {
+        if self.next_request().await.is_err() {
             debug!("Stopping forwarder {} because leadership hung up", self.id);
             return false;
         }
@@ -894,7 +923,7 @@ impl<S: Storage, R: RPC> Forwarder<S, R> {
     }
 
     async fn next_request(&self) -> Result<(), RecvError> {
-        if let Ok(_) = self.new_logs_rx.try_recv() {
+        if self.new_logs_rx.try_recv().is_ok() {
             return Ok(());
         }
         // Wait for the next update request, or the next heartbeat interval, whichever is first.

@@ -5,8 +5,10 @@
 
 mod client;
 mod config;
-mod error;
 mod protocol;
 mod rpc;
 mod state;
 mod storage;
+
+pub use client::{ClientConfig, RaftClient as Client};
+pub use config::ServerConfig;

@@ -1,14 +1,16 @@
+use crate::client::{ClientError, RaftClient};
 use crate::rpc::{
-    AppendEntriesRequest, AppendEntriesResponse, RPCBuilder, RaftServer, RequestVoteRequest,
-    RequestVoteResponse, RPC,
+    AppendEntriesRequest, AppendEntriesResponse, ClientApplyResponse, ClientQueryResponse,
+    RPCBuilder, RaftServer, RequestVoteRequest, RequestVoteResponse, RPC,
 };
+use crate::state::{Command, Query, QueryResponse};
 use crate::storage::Storage;
 use bytes::buf::BufExt;
 use futures::TryFutureExt;
 use hyper::server::conn::AddrStream;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Method, Request, Response, Server};
-use log::{error, info, trace};
+use log::{debug, error, info, trace};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::convert::Infallible;
 use std::error::Error;
@@ -38,7 +40,7 @@ impl RPC for HttpRPC {
         peer_address: String,
         request: AppendEntriesRequest,
     ) -> Result<AppendEntriesResponse, Box<dyn Error + Send + Sync>> {
-        send_request(self, &peer_address, "append_entries", request).await
+        Ok(send_request(self, &peer_address, "append_entries", request).await?)
     }
 
     async fn request_vote(
@@ -46,7 +48,7 @@ impl RPC for HttpRPC {
         peer_address: String,
         request: RequestVoteRequest,
     ) -> Result<RequestVoteResponse, Box<dyn Error + Send + Sync>> {
-        send_request(self, &peer_address, "request_vote", request).await
+        Ok(send_request(self, &peer_address, "request_vote", request).await?)
     }
 }
 
@@ -67,6 +69,7 @@ fn start_server<A: ToSocketAddrs, S: Storage>(
             let server = server.clone();
             async move {
                 Ok::<_, Infallible>(service_fn(move |req: Request<Body>| {
+                    trace!("Serving request {} {}", req.method(), req.uri());
                     let server = server.clone();
                     async move { Ok::<_, Infallible>(serve_request(server, req).await) }
                 }))
@@ -99,6 +102,22 @@ async fn serve_request<S: Storage>(
             parse_request_body(req)
                 .and_then(|req| async move {
                     let response = server.request_vote(req).await?;
+                    make_response_body(response)
+                })
+                .await
+        }
+        (&Method::POST, "/v1/apply") => {
+            parse_request_body(req)
+                .and_then(|req| async move {
+                    let response = server.apply(req).await?;
+                    make_response_body(response)
+                })
+                .await
+        }
+        (&Method::POST, "/v1/query") => {
+            parse_request_body(req)
+                .and_then(|req| async move {
+                    let response = server.query(req).await?;
                     make_response_body(response)
                 })
                 .await
@@ -138,11 +157,12 @@ async fn send_request<'de, S, D>(
     peer_address: &str,
     method_name: &str,
     request: S,
-) -> Result<D, Box<dyn Error + Send + Sync>>
+) -> Result<D, ClientError>
 where
     S: Serialize,
     D: DeserializeOwned,
 {
+    trace!("{}: sending request to {}", method_name, peer_address);
     let body = serde_json::to_vec(&request)?;
     let req = Request::builder()
         .method(Method::POST)
@@ -150,16 +170,91 @@ where
         .header("content-type", "application/json")
         .body(Body::from(body))?;
     let resp = client.request(req).await?;
-    // if !resp.status().is_success() {
-    //     error!(
-    //         "{} to peer {} failed with status {}",
-    //         method_name,
-    //         peer_address,
-    //         resp.status()
-    //     );
-    //     return Err(Box::new("Failed request"));
-    // }
+    trace!("{}: response status {}", method_name, resp.status());
+    if !resp.status().is_success() {
+        debug!(
+            "{}: server {} failed with status {}",
+            method_name,
+            peer_address,
+            resp.status()
+        );
+    }
     let bytes = hyper::body::to_bytes(resp.into_body()).await?;
+    trace!(
+        "{}: server responded with: {}",
+        method_name,
+        String::from_utf8(bytes.to_vec()).unwrap(),
+    );
     let resp = serde_json::from_reader(bytes.reader())?;
     Ok(resp)
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct HttpClientConfig {}
+
+pub struct HttpClient {
+    leader_address: String,
+    max_retries: usize,
+    http: hyper::Client<hyper::client::HttpConnector>,
+}
+
+impl HttpClient {
+    pub fn new(leader_address: String, max_retries: usize) -> HttpClient {
+        HttpClient {
+            leader_address,
+            max_retries,
+            http: hyper::Client::new(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl RaftClient for HttpClient {
+    async fn apply(&mut self, cmd: Command) -> Result<(), ClientError> {
+        for _attempt in 0..self.max_retries {
+            let response: Result<ClientApplyResponse, ClientError> =
+                send_request(&self.http, &self.leader_address, "apply", cmd.clone()).await;
+            match response {
+                Ok(ClientApplyResponse { success: true, .. }) => {
+                    return Ok(());
+                }
+                Ok(ClientApplyResponse {
+                    leader_address: leader_id,
+                    success: false,
+                }) => {
+                    if let Some(leader_id) = leader_id {
+                        self.leader_address = leader_id;
+                    }
+                }
+                Err(e) => error!("Error while communicating with raft server: {}", e),
+            }
+        }
+        Err(ClientError::MaxRetriesReached)
+    }
+
+    async fn query(&mut self, query: Query) -> Result<QueryResponse, ClientError> {
+        for _attempt in 0..self.max_retries {
+            let response: Result<ClientQueryResponse, ClientError> =
+                send_request(&self.http, &self.leader_address, "query", query.clone()).await;
+            match response {
+                Ok(ClientQueryResponse {
+                    response: Some(response),
+                    ..
+                }) => {
+                    return Ok(response);
+                }
+                Ok(ClientQueryResponse {
+                    leader_address: leader_id,
+                    response: None,
+                    ..
+                }) => {
+                    if let Some(leader_id) = leader_id {
+                        self.leader_address = leader_id;
+                    }
+                }
+                Err(e) => error!("Error while communicating with raft server: {}", e),
+            }
+        }
+        Err(ClientError::MaxRetriesReached)
+    }
 }

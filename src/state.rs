@@ -1,8 +1,6 @@
-use crate::storage::Storage;
-use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-#[derive(Deserialize, Serialize, Debug, Clone)]
+#[derive(Deserialize, Serialize, Debug, Clone, Eq, PartialEq)]
 pub enum Command {
     #[cfg(feature = "kv-store")]
     KV(KVCommand),
@@ -52,18 +50,16 @@ impl StateMachine {
     {
         match query.into() {
             #[cfg(feature = "kv-store")]
-            Query::KV(ref query) => QueryResponse::KV(self.kv.query(cmd)),
+            Query::KV(ref query) => QueryResponse::KV(self.kv.query(query)),
         }
     }
 }
 
 #[cfg(feature = "kv-store")]
-pub use kv::{Command as KVCommand, Query as KVQuery, QueryResponse as KVResponse};
+pub use kv::{Command as KVCommand, Query as KVQuery, QueryResponse as KVQueryResponse};
 
 #[cfg(feature = "kv-store")]
 mod kv {
-    use async_lock::Lock;
-    use async_trait::async_trait;
     use bytes::Bytes;
     use serde::{Deserialize, Serialize};
     use std::collections::HashMap;
@@ -98,14 +94,26 @@ mod kv {
         }
     }
 
-    #[derive(Serialize, Deserialize, Debug, Clone)]
+    #[derive(Serialize, Deserialize, Debug, Clone, Eq, PartialEq)]
     pub enum Command {
         Put { key: String, value: Bytes },
+    }
+
+    impl Into<super::Command> for Command {
+        fn into(self) -> super::Command {
+            super::Command::KV(self)
+        }
     }
 
     #[derive(Serialize, Deserialize, Debug, Clone)]
     pub enum Query {
         Get { key: String },
+    }
+
+    impl Into<super::Query> for Query {
+        fn into(self) -> super::Query {
+            super::Query::KV(self)
+        }
     }
 
     #[derive(Serialize, Deserialize, Debug, Clone)]

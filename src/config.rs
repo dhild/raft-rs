@@ -1,12 +1,11 @@
 use crate::protocol::Peer;
 use crate::rpc::HttpConfig;
-use crate::state::StateMachine;
 use crate::storage::{MemoryConfig, MemoryStorage, Storage};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct Config {
+pub struct ServerConfig {
     pub id: String,
     pub peer: Option<Vec<PeerConfig>>,
     pub timeout: Option<Duration>,
@@ -33,11 +32,11 @@ pub struct StorageConfig {
     pub memory: Option<MemoryConfig>,
 }
 
-impl Config {
+impl ServerConfig {
     pub async fn spawn_server(&self) -> Result<(), std::io::Error> {
         let id = self.id.clone();
         let peers = self.peers();
-        let timeout = self.timeout.unwrap_or(Duration::from_millis(500));
+        let timeout = self.timeout.unwrap_or_else(|| Duration::from_millis(500));
 
         let storage = self.storage.build()?;
 
@@ -70,11 +69,20 @@ impl RPCConfig {
     ) -> Result<(), std::io::Error> {
         #[cfg(feature = "http-rpc")]
         if let Some(ref cfg) = self.http {
-            crate::protocol::start(id, peers, timeout, cfg.clone(), storage).await
+            crate::protocol::start(
+                id,
+                cfg.address.clone(),
+                peers,
+                timeout,
+                cfg.clone(),
+                storage,
+            )
+            .await?;
+            return Ok(());
         }
         Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "No valid storage configuration",
+            "No valid RPC configuration",
         ))
     }
 }

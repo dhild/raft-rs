@@ -1,3 +1,4 @@
+use crate::state::Command;
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -9,7 +10,7 @@ pub struct LogEntry {
 
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
 pub enum LogCommand {
-    Command(crate::state::Commmand),
+    Command(Command),
     Noop,
 }
 
