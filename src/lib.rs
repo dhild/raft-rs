@@ -9,12 +9,14 @@ mod rpc;
 mod state;
 mod storage;
 
+pub use crate::client::Client;
+
+use crate::client::RaftClient;
 use crate::protocol::{LogCommitter, Peer, ProtocolState, ProtocolTasks, RaftConfiguration};
-use crate::rpc::{HttpRPC, RaftServer};
+use crate::rpc::{HttpClient, HttpRPC, RaftServer, RPC};
 use crate::state::StateMachine;
 use crate::storage::{MemoryStorage, Storage};
 use async_lock::Lock;
-pub use client::{ClientConfig, RaftClient as Client};
 use log::debug;
 use std::sync::Arc;
 use std::time::Duration;
@@ -63,6 +65,14 @@ impl ServerBuilder {
 
     #[cfg(feature = "http-rpc")]
     pub fn spawn_http(&mut self) -> Result<(), std::io::Error> {
+        let address = self.address.clone();
+        self.spawn_protocol(|server| HttpRPC::spawn_server(&address, server))
+    }
+
+    fn spawn_protocol<R: RPC + 'static, F: FnOnce(RaftServer) -> std::io::Result<R>>(
+        &mut self,
+        rpc: F,
+    ) -> std::io::Result<()> {
         let id = self.id.clone();
         let storage = self.storage.clone().expect("no storage device configured");
         self.storage = None;
@@ -91,7 +101,7 @@ impl ServerBuilder {
             state_machine.clone(),
         );
 
-        let rpc = HttpRPC::spawn_server(&self.address, raft_server)?;
+        let rpc = Arc::new(rpc(raft_server)?) as Arc<dyn RPC>;
 
         tokio::spawn(async move {
             debug!("Starting log committer task");
@@ -106,7 +116,7 @@ impl ServerBuilder {
                 timeout,
                 storage,
                 current_state,
-                Arc::new(rpc),
+                rpc,
                 term_updates_tx,
                 term_updates_rx,
                 commits_to_apply_tx,
@@ -118,5 +128,34 @@ impl ServerBuilder {
             debug!("Closing raft protocol task");
         });
         Ok(())
+    }
+}
+
+pub fn client(address: &str) -> ClientBuilder {
+    ClientBuilder::new(address)
+}
+
+pub struct ClientBuilder {
+    address: String,
+    max_retries: Option<usize>,
+}
+
+impl ClientBuilder {
+    pub fn new(address: &str) -> ClientBuilder {
+        ClientBuilder {
+            address: address.to_string(),
+            max_retries: None,
+        }
+    }
+
+    pub fn max_retries(&mut self, max_retries: usize) -> &mut Self {
+        self.max_retries = Some(max_retries);
+        self
+    }
+
+    #[cfg(feature = "http-rpc")]
+    pub fn build_http_client(&mut self) -> Client {
+        let client = HttpClient::new(self.address.clone(), self.max_retries.unwrap_or(5));
+        Client::new(Box::new(client) as Box<dyn RaftClient>)
     }
 }

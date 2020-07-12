@@ -1,5 +1,4 @@
 use env_logger::Env;
-use pontoon::{Client, ClientConfig};
 
 pub fn spawn_three_servers() {
     pontoon::server("server1", "localhost:8001")
@@ -20,11 +19,6 @@ pub fn spawn_three_servers() {
         .in_memory_storage()
         .spawn_http()
         .unwrap();
-}
-
-pub fn client(config: &'static str) -> impl Client {
-    let config: ClientConfig = toml::from_str(config).unwrap();
-    config.build().unwrap()
 }
 
 pub fn setup() {

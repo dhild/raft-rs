@@ -1,15 +1,29 @@
-use crate::rpc::{HttpClient, HttpClientConfig};
 pub use crate::state::{Command, Query, QueryResponse};
 use crate::state::{KVCommand, KVQuery, KVQueryResponse};
 use bytes::Bytes;
-use serde::{Deserialize, Serialize};
 
 #[async_trait::async_trait]
 pub trait RaftClient {
     async fn apply(&mut self, cmd: Command) -> Result<(), ClientError>;
     async fn query(&mut self, query: Query) -> Result<QueryResponse, ClientError>;
+}
 
-    async fn put(&mut self, key: &str, value: &[u8]) -> Result<(), ClientError> {
+pub struct Client {
+    client: Box<dyn RaftClient>,
+}
+
+impl Client {
+    pub(crate) fn new(client: Box<dyn RaftClient>) -> Client {
+        Client { client }
+    }
+    pub async fn apply(&mut self, cmd: Command) -> Result<(), ClientError> {
+        self.client.apply(cmd).await
+    }
+    pub async fn query(&mut self, query: Query) -> Result<QueryResponse, ClientError> {
+        self.client.query(query).await
+    }
+
+    pub async fn put(&mut self, key: &str, value: &[u8]) -> Result<(), ClientError> {
         self.apply(
             KVCommand::Put {
                 key: key.to_string(),
@@ -20,7 +34,7 @@ pub trait RaftClient {
         .await
     }
 
-    async fn get(&mut self, key: &str) -> Result<Option<Bytes>, ClientError> {
+    pub async fn get(&mut self, key: &str) -> Result<Option<Bytes>, ClientError> {
         match self
             .query(
                 KVQuery::Get {
@@ -33,28 +47,6 @@ pub trait RaftClient {
             QueryResponse::KV(KVQueryResponse::Get { value }) => Ok(value),
             _ => unreachable!("Invalid response from the server"),
         }
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct ClientConfig {
-    pub address: String,
-    pub max_retries: Option<usize>,
-    #[cfg(feature = "http-rpc")]
-    pub http: Option<HttpClientConfig>,
-}
-
-impl ClientConfig {
-    pub fn build(&self) -> Result<impl RaftClient, std::io::Error> {
-        #[cfg(feature = "http-rpc")]
-        if let Some(ref _cfg) = self.http {
-            let client = HttpClient::new(self.address.clone(), self.max_retries.unwrap_or(5));
-            return Ok(client);
-        }
-        Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "No valid client configuration",
-        ))
     }
 }
 
