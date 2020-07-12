@@ -28,7 +28,6 @@ pub struct RPCConfig {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct StorageConfig {
-    #[cfg(feature = "memory-storage")]
     pub memory: Option<MemoryConfig>,
 }
 
@@ -89,7 +88,6 @@ impl RPCConfig {
 
 impl StorageConfig {
     pub fn build(&self) -> Result<impl Storage, std::io::Error> {
-        #[cfg(feature = "memory-storage")]
         if let Some(ref cfg) = self.memory {
             let storage: MemoryStorage = cfg.into();
             return Ok(storage);

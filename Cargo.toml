@@ -7,9 +7,7 @@ edition = "2018"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [features]
-default = ["memory-storage", "kv-store", "http-rpc"]
-memory-storage = []
-kv-store = ["serde_json"]
+default = ["http-rpc"]
 http-rpc = ["serde_json", "hyper"]
 
 [dependencies]
@@ -29,8 +27,3 @@ futures = "0.3"
 env_logger = "0.7"
 toml = "0.5"
 tokio = {version = "0.2", features = ["test-util"]}
-
-#[[bin]]
-#name = "raft"
-#path = "src/bin/raft.rs"
-#required-features = ["runtime"]

@@ -27,8 +27,6 @@ pub trait Storage: Sized + Send + Sync + 'static {
     fn remove_entries_starting_at(&mut self, log_index: usize) -> std::io::Result<()>;
 }
 
-#[cfg(feature = "memory-storage")]
 pub use memory::{MemoryConfig, MemoryStorage};
 
-#[cfg(feature = "memory-storage")]
 mod memory;

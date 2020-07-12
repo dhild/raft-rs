@@ -1,34 +1,31 @@
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Deserialize, Serialize, Debug, Clone, Eq, PartialEq)]
 pub enum Command {
-    #[cfg(feature = "kv-store")]
     KV(KVCommand),
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub enum Query {
-    #[cfg(feature = "kv-store")]
     KV(KVQuery),
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub enum QueryResponse {
     None,
-    #[cfg(feature = "kv-store")]
     KV(KVQueryResponse),
 }
 
 pub struct StateMachine {
-    #[cfg(feature = "kv-store")]
-    kv: kv::KeyValueStore,
+    kv: KeyValueStore,
 }
 
 impl Default for StateMachine {
     fn default() -> Self {
         StateMachine {
-            #[cfg(feature = "kv-store")]
-            kv: kv::KeyValueStore::default(),
+            kv: KeyValueStore::default(),
         }
     }
 }
@@ -39,7 +36,6 @@ impl StateMachine {
         C: Into<Command>,
     {
         match cmd.into() {
-            #[cfg(feature = "kv-store")]
             Command::KV(ref cmd) => self.kv.apply(cmd),
         }
     }
@@ -49,75 +45,64 @@ impl StateMachine {
         Q: Into<Query>,
     {
         match query.into() {
-            #[cfg(feature = "kv-store")]
             Query::KV(ref query) => QueryResponse::KV(self.kv.query(query)),
         }
     }
 }
 
-#[cfg(feature = "kv-store")]
-pub use kv::{Command as KVCommand, Query as KVQuery, QueryResponse as KVQueryResponse};
+pub struct KeyValueStore {
+    data: HashMap<String, Bytes>,
+}
 
-#[cfg(feature = "kv-store")]
-mod kv {
-    use bytes::Bytes;
-    use serde::{Deserialize, Serialize};
-    use std::collections::HashMap;
-
-    pub struct KeyValueStore {
-        data: HashMap<String, Bytes>,
+impl Default for KeyValueStore {
+    fn default() -> Self {
+        let data = HashMap::new();
+        KeyValueStore { data }
     }
+}
 
-    impl Default for KeyValueStore {
-        fn default() -> Self {
-            let data = HashMap::new();
-            KeyValueStore { data }
-        }
-    }
-
-    impl KeyValueStore {
-        pub fn apply(&mut self, cmd: &Command) {
-            match cmd {
-                Command::Put { key, value } => {
-                    self.data.insert(key.to_string(), value.clone());
-                }
-            }
-        }
-
-        pub fn query(&self, query: &Query) -> QueryResponse {
-            match query {
-                Query::Get { key } => {
-                    let value = self.data.get(key).cloned();
-                    QueryResponse::Get { value }
-                }
+impl KeyValueStore {
+    pub fn apply(&mut self, cmd: &KVCommand) {
+        match cmd {
+            KVCommand::Put { key, value } => {
+                self.data.insert(key.to_string(), value.clone());
             }
         }
     }
 
-    #[derive(Serialize, Deserialize, Debug, Clone, Eq, PartialEq)]
-    pub enum Command {
-        Put { key: String, value: Bytes },
-    }
-
-    impl Into<super::Command> for Command {
-        fn into(self) -> super::Command {
-            super::Command::KV(self)
+    pub fn query(&self, query: &KVQuery) -> KVQueryResponse {
+        match query {
+            KVQuery::Get { key } => {
+                let value = self.data.get(key).cloned();
+                KVQueryResponse::Get { value }
+            }
         }
     }
+}
 
-    #[derive(Serialize, Deserialize, Debug, Clone)]
-    pub enum Query {
-        Get { key: String },
-    }
+#[derive(Serialize, Deserialize, Debug, Clone, Eq, PartialEq)]
+pub enum KVCommand {
+    Put { key: String, value: Bytes },
+}
 
-    impl Into<super::Query> for Query {
-        fn into(self) -> super::Query {
-            super::Query::KV(self)
-        }
+impl Into<Command> for KVCommand {
+    fn into(self) -> Command {
+        Command::KV(self)
     }
+}
 
-    #[derive(Serialize, Deserialize, Debug, Clone)]
-    pub enum QueryResponse {
-        Get { value: Option<Bytes> },
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub enum KVQuery {
+    Get { key: String },
+}
+
+impl Into<Query> for KVQuery {
+    fn into(self) -> Query {
+        Query::KV(self)
     }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub enum KVQueryResponse {
+    Get { value: Option<Bytes> },
 }

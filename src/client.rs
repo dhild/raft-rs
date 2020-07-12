@@ -9,7 +9,6 @@ pub trait RaftClient {
     async fn apply(&mut self, cmd: Command) -> Result<(), ClientError>;
     async fn query(&mut self, query: Query) -> Result<QueryResponse, ClientError>;
 
-    #[cfg(feature = "kv-store")]
     async fn put(&mut self, key: &str, value: &[u8]) -> Result<(), ClientError> {
         self.apply(
             KVCommand::Put {
@@ -21,7 +20,6 @@ pub trait RaftClient {
         .await
     }
 
-    #[cfg(feature = "kv-store")]
     async fn get(&mut self, key: &str) -> Result<Option<Bytes>, ClientError> {
         match self
             .query(
