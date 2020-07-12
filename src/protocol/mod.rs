@@ -1,4 +1,4 @@
-use crate::rpc::{AppendEntriesRequest, RPCBuilder, RaftServer, RequestVoteRequest, RPC};
+use crate::rpc::{AppendEntriesRequest, RequestVoteRequest, RPC};
 use crate::state::StateMachine;
 use crate::storage::{LogCommand, LogEntry, Storage};
 use async_channel::{Receiver, RecvError, Sender, TryRecvError, TrySendError};
@@ -7,6 +7,7 @@ use log::{debug, error, info, trace};
 use rand::Rng;
 use std::collections::HashMap;
 use std::fmt::{self, Display, Formatter};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::select;
 
@@ -87,70 +88,6 @@ impl Display for Peer {
     }
 }
 
-pub async fn start<R, S>(
-    id: String,
-    address: String,
-    peers: Vec<Peer>,
-    timeout: Duration,
-    rpc_config: R,
-    storage: S,
-) -> Result<(), std::io::Error>
-where
-    R: RPCBuilder,
-    S: Storage,
-{
-    let configuration = Lock::new(RaftConfiguration::new(id.clone(), address, peers));
-    let storage = Lock::new(storage);
-    let state_machine = Lock::new(StateMachine::default());
-    let current_state = Lock::new(ProtocolState::Follower);
-    let last_applied_tx = Lock::new(Vec::new());
-    let (commits_to_apply_tx, commits_to_apply_rx) = async_channel::bounded(1);
-    let (append_entries_tx, append_entries_rx) = async_channel::bounded(1);
-    let (term_updates_tx, term_updates_rx) = async_channel::bounded(1);
-    let (new_logs_tx, new_logs_rx) = async_channel::bounded(1);
-
-    let raft_server = RaftServer::new(
-        configuration.clone(),
-        storage.clone(),
-        term_updates_tx.clone(),
-        append_entries_tx,
-        current_state.clone(),
-        new_logs_tx,
-        last_applied_tx.clone(),
-        state_machine.clone(),
-    );
-
-    let rpc = rpc_config.build(raft_server)?;
-
-    let mut tasks = ProtocolTasks::new(
-        id,
-        configuration,
-        timeout,
-        storage,
-        current_state,
-        rpc,
-        term_updates_tx,
-        term_updates_rx,
-        commits_to_apply_tx,
-        append_entries_rx,
-        new_logs_rx,
-    );
-
-    tokio::spawn(async move {
-        debug!("Starting log committer task");
-        let mut lc = LogCommitter::new(state_machine, commits_to_apply_rx, last_applied_tx);
-        lc.run().await;
-        debug!("Closing log committer task");
-    });
-    tokio::spawn(async move {
-        debug!("Starting raft protocol task");
-        tasks.run().await;
-        debug!("Closing raft protocol task");
-    });
-
-    Ok(())
-}
-
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum ProtocolState {
     Follower,
@@ -177,7 +114,7 @@ pub struct LogCommitter {
 }
 
 impl LogCommitter {
-    fn new(
+    pub fn new(
         state_machine: Lock<StateMachine>,
         commits: Receiver<(usize, LogCommand)>,
         last_applied_tx: Lock<Vec<Sender<usize>>>,
@@ -189,7 +126,7 @@ impl LogCommitter {
         }
     }
 
-    async fn run(&mut self) {
+    pub async fn run(&mut self) {
         let mut last_applied = 0;
         while let Ok((commit_index, cmd)) = self.commits.recv().await {
             if commit_index != (last_applied + 1) {
@@ -217,12 +154,12 @@ impl LogCommitter {
     }
 }
 
-pub struct ProtocolTasks<S: Storage, R: RPC> {
+pub struct ProtocolTasks {
     id: String,
     configuration: Lock<RaftConfiguration>,
     timeout: Duration,
-    storage: Lock<S>,
-    rpc: R,
+    storage: Lock<Box<dyn Storage>>,
+    rpc: Arc<dyn RPC>,
     commit_index: Lock<usize>,
     current_state: Lock<ProtocolState>,
     term_updates_tx: Sender<()>,
@@ -232,20 +169,20 @@ pub struct ProtocolTasks<S: Storage, R: RPC> {
     new_logs_rx: Receiver<usize>,
 }
 
-impl<S: Storage, R: RPC> ProtocolTasks<S, R> {
-    fn new(
+impl ProtocolTasks {
+    pub fn new(
         id: String,
         configuration: Lock<RaftConfiguration>,
         timeout: Duration,
-        storage: Lock<S>,
+        storage: Lock<Box<dyn Storage>>,
         current_state: Lock<ProtocolState>,
-        rpc: R,
+        rpc: Arc<dyn RPC>,
         term_updates_tx: Sender<()>,
         term_updates_rx: Receiver<()>,
         commits_to_apply_tx: Sender<(usize, LogCommand)>,
         append_entries_rx: Receiver<usize>,
         new_logs_rx: Receiver<usize>,
-    ) -> ProtocolTasks<S, R> {
+    ) -> ProtocolTasks {
         let commit_index = Lock::new(0);
 
         ProtocolTasks {
@@ -264,7 +201,7 @@ impl<S: Storage, R: RPC> ProtocolTasks<S, R> {
         }
     }
 
-    async fn run(&mut self) {
+    pub async fn run(&mut self) {
         loop {
             // Grab the current state and run the appropriate protocol logic.
             let state = { *self.current_state.lock().await };
@@ -331,24 +268,24 @@ impl<S: Storage, R: RPC> ProtocolTasks<S, R> {
     }
 }
 
-pub struct Follower<S: Storage> {
+pub struct Follower {
     timeout: Duration,
-    storage: Lock<S>,
+    storage: Lock<Box<dyn Storage>>,
     commit_index: Lock<usize>,
     term_updates_rx: Receiver<()>,
     append_entries_rx: Receiver<usize>,
     commits_to_apply_tx: Sender<(usize, LogCommand)>,
 }
 
-impl<S: Storage> Follower<S> {
+impl Follower {
     pub fn new(
         timeout: Duration,
-        storage: Lock<S>,
+        storage: Lock<Box<dyn Storage>>,
         commit_index: Lock<usize>,
         term_updates_rx: Receiver<()>,
         append_entries_rx: Receiver<usize>,
         commits_to_apply_tx: Sender<(usize, LogCommand)>,
-    ) -> Follower<S> {
+    ) -> Follower {
         let timeout = timeout.mul_f32(1. + 2. * rand::thread_rng().gen::<f32>());
         Follower {
             timeout,
@@ -410,24 +347,24 @@ impl<S: Storage> Follower<S> {
     }
 }
 
-pub struct Candidate<S: Storage, R: RPC> {
+pub struct Candidate {
     id: String,
     configuration: Lock<RaftConfiguration>,
     timeout: Duration,
-    storage: Lock<S>,
-    rpc: R,
+    storage: Lock<Box<dyn Storage>>,
+    rpc: Arc<dyn RPC>,
     term_updates_rx: Receiver<()>,
 }
 
-impl<S: Storage, R: RPC> Candidate<S, R> {
+impl Candidate {
     pub fn new(
         id: String,
         configuration: Lock<RaftConfiguration>,
         timeout: Duration,
-        storage: Lock<S>,
-        rpc: R,
+        storage: Lock<Box<dyn Storage>>,
+        rpc: Arc<dyn RPC>,
         term_updates_rx: Receiver<()>,
-    ) -> Candidate<S, R> {
+    ) -> Candidate {
         let timeout = timeout.mul_f32(1. + 2. * rand::thread_rng().gen::<f32>());
         Candidate {
             id,
@@ -595,9 +532,9 @@ enum ElectionResult {
     OutdatedTerm(usize),
 }
 
-pub struct Leader<S: Storage> {
+pub struct Leader {
     configuration: Lock<RaftConfiguration>,
-    storage: Lock<S>,
+    storage: Lock<Box<dyn Storage>>,
     commit_index: Lock<usize>,
     term_updates_rx: Receiver<()>,
     commits_to_apply_tx: Sender<(usize, LogCommand)>,
@@ -607,19 +544,19 @@ pub struct Leader<S: Storage> {
     forward_updates: Vec<Sender<usize>>,
 }
 
-impl<S: Storage> Leader<S> {
-    pub async fn start<R: RPC>(
+impl Leader {
+    pub async fn start(
         id: String,
         configuration: Lock<RaftConfiguration>,
         timeout: Duration,
-        storage: Lock<S>,
-        rpc: R,
+        storage: Lock<Box<dyn Storage>>,
+        rpc: Arc<dyn RPC>,
         commit_index: Lock<usize>,
         term_updates_tx: Sender<()>,
         term_updates_rx: Receiver<()>,
         commits_to_apply_tx: Sender<(usize, LogCommand)>,
         new_logs_rx: Receiver<usize>,
-    ) -> std::io::Result<Leader<S>> {
+    ) -> std::io::Result<Leader> {
         let timeout = timeout.mul_f32(0.5);
         let (index_update_tx, index_update_rx) = async_channel::bounded(15);
         let mut forward_updates = Vec::new();
@@ -656,14 +593,14 @@ impl<S: Storage> Leader<S> {
 
     pub fn new(
         configuration: Lock<RaftConfiguration>,
-        storage: Lock<S>,
+        storage: Lock<Box<dyn Storage>>,
         commit_index: Lock<usize>,
         term_updates_rx: Receiver<()>,
         commits_to_apply_tx: Sender<(usize, LogCommand)>,
         new_logs_rx: Receiver<usize>,
         index_update_rx: Receiver<(String, usize)>,
         forward_updates: Vec<Sender<usize>>,
-    ) -> Leader<S> {
+    ) -> Leader {
         Leader {
             configuration,
             storage,
@@ -796,33 +733,33 @@ impl<S: Storage> Leader<S> {
     }
 }
 
-pub struct Forwarder<S: Storage, R: RPC> {
+pub struct Forwarder {
     id: String,
     peer: Peer,
     heartbeat_interval: Duration,
     append_entries_timeout: Duration,
     next_index: usize,
     match_index_tx: Sender<(String, usize)>,
-    storage: Lock<S>,
+    storage: Lock<Box<dyn Storage>>,
     commit_index: Lock<usize>,
     new_logs_rx: Receiver<usize>,
     term_updates_tx: Sender<()>,
-    rpc: R,
+    rpc: Arc<dyn RPC>,
 }
 
-impl<S: Storage, R: RPC> Forwarder<S, R> {
+impl Forwarder {
     pub fn new(
         id: String,
         peer: Peer,
         timeout: Duration,
         match_index_tx: Sender<(String, usize)>,
-        storage: Lock<S>,
+        storage: Lock<Box<dyn Storage>>,
         commit_index: Lock<usize>,
         new_logs_rx: Receiver<usize>,
         term_updates_tx: Sender<()>,
-        rpc: R,
+        rpc: Arc<dyn RPC>,
         next_index: usize,
-    ) -> Forwarder<S, R> {
+    ) -> Forwarder {
         // Raft is able to elect and maintain a steady leader as long as the system satisfies the
         // timing requirement
         //     broadcastTime << electionTimeout << MTBF

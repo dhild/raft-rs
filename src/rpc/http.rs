@@ -1,10 +1,9 @@
 use crate::client::{ClientError, RaftClient};
 use crate::rpc::{
     AppendEntriesRequest, AppendEntriesResponse, ClientApplyResponse, ClientQueryResponse,
-    RPCBuilder, RaftServer, RequestVoteRequest, RequestVoteResponse, RPC,
+    RaftServer, RequestVoteRequest, RequestVoteResponse, RPC,
 };
 use crate::state::{Command, Query, QueryResponse};
-use crate::storage::Storage;
 use bytes::buf::BufExt;
 use futures::TryFutureExt;
 use hyper::server::conn::AddrStream;
@@ -17,21 +16,18 @@ use std::error::Error;
 use std::net::ToSocketAddrs;
 use std::sync::Arc;
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct HttpConfig {
-    pub address: String,
+pub struct HttpRPC {
+    client: hyper::Client<hyper::client::HttpConnector>,
 }
 
-impl RPCBuilder for HttpConfig {
-    type RPC = HttpRPC;
-
-    fn build<S: Storage>(&self, server: RaftServer<S>) -> std::io::Result<Self::RPC> {
-        start_server(self.address.clone(), Arc::new(server))?;
-        Ok(HttpRPC::new())
+impl HttpRPC {
+    pub fn spawn_server(address: &str, server: RaftServer) -> std::io::Result<HttpRPC> {
+        start_server(address, Arc::new(server))?;
+        Ok(HttpRPC {
+            client: hyper::Client::new(),
+        })
     }
 }
-
-pub type HttpRPC = hyper::Client<hyper::client::HttpConnector>;
 
 #[async_trait::async_trait]
 impl RPC for HttpRPC {
@@ -40,7 +36,7 @@ impl RPC for HttpRPC {
         peer_address: String,
         request: AppendEntriesRequest,
     ) -> Result<AppendEntriesResponse, Box<dyn Error + Send + Sync>> {
-        Ok(send_request(self, &peer_address, "append_entries", request).await?)
+        Ok(send_request(&self.client, &peer_address, "append_entries", request).await?)
     }
 
     async fn request_vote(
@@ -48,14 +44,11 @@ impl RPC for HttpRPC {
         peer_address: String,
         request: RequestVoteRequest,
     ) -> Result<RequestVoteResponse, Box<dyn Error + Send + Sync>> {
-        Ok(send_request(self, &peer_address, "request_vote", request).await?)
+        Ok(send_request(&self.client, &peer_address, "request_vote", request).await?)
     }
 }
 
-fn start_server<A: ToSocketAddrs, S: Storage>(
-    addr: A,
-    server: Arc<RaftServer<S>>,
-) -> Result<(), std::io::Error> {
+fn start_server<A: ToSocketAddrs>(addr: A, server: Arc<RaftServer>) -> Result<(), std::io::Error> {
     let addrs = addr.to_socket_addrs()?;
     for addr in addrs {
         info!("Serving Raft at {}", &addr);
@@ -85,10 +78,7 @@ fn start_server<A: ToSocketAddrs, S: Storage>(
     Ok(())
 }
 
-async fn serve_request<S: Storage>(
-    server: Arc<RaftServer<S>>,
-    req: Request<Body>,
-) -> Response<Body> {
+async fn serve_request(server: Arc<RaftServer>, req: Request<Body>) -> Response<Body> {
     let response = match (req.method(), req.uri().path()) {
         (&Method::POST, "/v1/append_entries") => {
             parse_request_body(req)

@@ -10,6 +10,7 @@ use async_lock::Lock;
 use env_logger::Env;
 use log::debug;
 use std::error::Error;
+use std::sync::Arc;
 use std::time::Duration;
 
 const TEST_TIMEOUT_MS: u64 = 150;
@@ -29,7 +30,7 @@ async fn follower_timeout() {
     let (commits_to_apply_tx, _commits_to_apply_rx) = async_channel::bounded(1);
     let follower = Follower::new(
         Duration::from_millis(TEST_TIMEOUT_MS),
-        Lock::new(MemoryStorage::new()),
+        Lock::new(Box::new(MemoryStorage::new())),
         Lock::new(0),
         term_updates_rx,
         append_entries_rx,
@@ -59,7 +60,7 @@ async fn follower_commit_processing() {
     let (_term_updates_tx, term_updates_rx) = async_channel::bounded(1);
     let (append_entries_tx, append_entries_rx) = async_channel::bounded(10);
     let (commits_to_apply_tx, _commits_to_apply_rx) = async_channel::bounded(10);
-    let storage = Lock::new(MemoryStorage::new());
+    let storage = Lock::new(Box::new(MemoryStorage::new()) as Box<dyn Storage>);
     let follower = Follower::new(
         Duration::from_millis(TEST_TIMEOUT_MS),
         storage.clone(),
@@ -99,7 +100,7 @@ async fn follower_rpc_shutdown() {
     let (_term_updates_tx, term_updates_rx) = async_channel::bounded(1);
     let (append_entries_tx, append_entries_rx) = async_channel::bounded(10);
     let (commits_to_apply_tx, _commits_to_apply_rx) = async_channel::bounded(10);
-    let storage = Lock::new(MemoryStorage::new());
+    let storage = Lock::new(Box::new(MemoryStorage::new()) as Box<dyn Storage>);
     let follower = Follower::new(
         Duration::from_millis(TEST_TIMEOUT_MS),
         storage.clone(),
@@ -247,7 +248,7 @@ struct CandidateTest {
     term_updates_tx: Sender<()>,
     peer1: TestRPCPeer,
     peer2: TestRPCPeer,
-    candidate: Candidate<MemoryStorage, TestRPC>,
+    candidate: Candidate,
 }
 
 impl CandidateTest {
@@ -266,8 +267,8 @@ impl CandidateTest {
                 vec![peer1.peer.clone(), peer2.peer.clone()],
             )),
             Duration::from_millis(TEST_TIMEOUT_MS),
-            Lock::new(MemoryStorage::new()),
-            rpc.clone(),
+            Lock::new(Box::new(MemoryStorage::new())),
+            Arc::new(rpc),
             term_updates_rx,
         );
         CandidateTest {
@@ -358,14 +359,14 @@ async fn candidate_rpc_shutdown() {
 }
 
 struct LeaderTest {
-    storage: Lock<MemoryStorage>,
+    storage: Lock<Box<dyn Storage>>,
     term_updates_tx: Sender<()>,
     commits_to_apply_rx: Receiver<(usize, LogCommand)>,
     new_logs_tx: Sender<usize>,
     index_update_tx: Sender<(String, usize)>,
     peer1: Receiver<usize>,
     peer2: Receiver<usize>,
-    leader: Leader<MemoryStorage>,
+    leader: Leader,
 }
 
 const LEADER_PEER_QUEUE_SIZE: usize = 10;
@@ -379,7 +380,7 @@ impl LeaderTest {
         let (index_update_tx, index_update_rx) = async_channel::unbounded();
         let (peer1_tx, peer1) = async_channel::bounded(LEADER_PEER_QUEUE_SIZE);
         let (peer2_tx, peer2) = async_channel::bounded(LEADER_PEER_QUEUE_SIZE);
-        let storage = Lock::new(MemoryStorage::new());
+        let storage = Lock::new(Box::new(MemoryStorage::new()) as Box<dyn Storage>);
 
         let leader = Leader::new(
             Lock::new(RaftConfiguration::new(
@@ -549,12 +550,12 @@ async fn leader_rpc_shutdown_consensus() {
 }
 
 struct ForwarderTest {
-    storage: Lock<MemoryStorage>,
+    storage: Lock<Box<dyn Storage>>,
     _term_updates_rx: Receiver<()>,
     match_index_rx: Receiver<(String, usize)>,
     new_logs_tx: Sender<usize>,
     peer: TestRPCPeer,
-    forwarder: Forwarder<MemoryStorage, TestRPC>,
+    forwarder: Forwarder,
 }
 
 impl ForwarderTest {
@@ -563,7 +564,7 @@ impl ForwarderTest {
         let (term_updates_tx, term_updates_rx) = async_channel::unbounded();
         let (match_index_tx, match_index_rx) = async_channel::unbounded();
         let (new_logs_tx, new_logs_rx) = async_channel::unbounded();
-        let storage = Lock::new(MemoryStorage::new());
+        let storage = Lock::new(Box::new(MemoryStorage::new()) as Box<dyn Storage>);
 
         let mut rpc = TestRPC::new();
         let peer = rpc.add_peer("peer1");
@@ -577,7 +578,7 @@ impl ForwarderTest {
             Lock::new(0),
             new_logs_rx,
             term_updates_tx,
-            rpc.clone(),
+            Arc::new(rpc),
             next_index,
         );
         ForwarderTest {

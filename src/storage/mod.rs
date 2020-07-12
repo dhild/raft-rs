@@ -14,7 +14,7 @@ pub enum LogCommand {
     Noop,
 }
 
-pub trait Storage: Sized + Send + Sync + 'static {
+pub trait Storage: Send + Sync {
     fn current_term(&self) -> std::io::Result<usize>;
     fn set_current_term(&mut self, current_term: usize) -> std::io::Result<()>;
     fn voted_for(&self) -> std::io::Result<Option<String>>;

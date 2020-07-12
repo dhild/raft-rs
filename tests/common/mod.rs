@@ -1,9 +1,25 @@
 use env_logger::Env;
-use pontoon::{Client, ClientConfig, ServerConfig};
+use pontoon::{Client, ClientConfig};
 
-pub async fn state_machine(config: &'static str) {
-    let config: ServerConfig = toml::from_str(config).unwrap();
-    config.spawn_server().await.unwrap();
+pub fn spawn_three_servers() {
+    pontoon::server("server1", "localhost:8001")
+        .peer("server2", "localhost:8002")
+        .peer("server3", "localhost:8003")
+        .in_memory_storage()
+        .spawn_http()
+        .unwrap();
+    pontoon::server("server2", "localhost:8002")
+        .peer("server1", "localhost:8001")
+        .peer("server3", "localhost:8003")
+        .in_memory_storage()
+        .spawn_http()
+        .unwrap();
+    pontoon::server("server3", "localhost:8003")
+        .peer("server1", "localhost:8001")
+        .peer("server2", "localhost:8002")
+        .in_memory_storage()
+        .spawn_http()
+        .unwrap();
 }
 
 pub fn client(config: &'static str) -> impl Client {

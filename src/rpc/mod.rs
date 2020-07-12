@@ -82,11 +82,11 @@ pub struct ClientQueryResponse {
 
 pub trait RPCBuilder {
     type RPC: RPC;
-    fn build<S: Storage>(&self, server: RaftServer<S>) -> std::io::Result<Self::RPC>;
+    fn build(&self, server: RaftServer) -> std::io::Result<Arc<dyn RPC>>;
 }
 
 #[async_trait]
-pub trait RPC: Clone + Send + Sync + 'static {
+pub trait RPC: Send + Sync {
     async fn append_entries(
         &self,
         peer_address: String,
@@ -101,9 +101,9 @@ pub trait RPC: Clone + Send + Sync + 'static {
 }
 
 #[derive(Clone)]
-pub struct RaftServer<S: Storage> {
+pub struct RaftServer {
     configuration: Lock<RaftConfiguration>,
-    storage: Lock<S>,
+    storage: Lock<Box<dyn Storage>>,
     term_updates: Sender<()>,
     append_entries_tx: Sender<usize>,
     current_state: Lock<ProtocolState>,
@@ -112,17 +112,17 @@ pub struct RaftServer<S: Storage> {
     state_machine: Lock<StateMachine>,
 }
 
-impl<S: Storage> RaftServer<S> {
+impl RaftServer {
     pub fn new(
         configuration: Lock<RaftConfiguration>,
-        storage: Lock<S>,
+        storage: Lock<Box<dyn Storage>>,
         term_updates: Sender<()>,
         append_entries_tx: Sender<usize>,
         current_state: Lock<ProtocolState>,
         new_logs_tx: Sender<usize>,
         last_applied_tx: Lock<Vec<Sender<usize>>>,
         state_machine: Lock<StateMachine>,
-    ) -> RaftServer<S> {
+    ) -> RaftServer {
         RaftServer {
             configuration,
             storage,
@@ -361,4 +361,5 @@ impl From<std::io::Error> for RaftServerError {
 mod http;
 
 #[cfg(feature = "http-rpc")]
-pub use http::{HttpClient, HttpClientConfig, HttpConfig, HttpRPC};
+pub use http::{HttpClient, HttpClientConfig, HttpRPC};
+use std::sync::Arc;
