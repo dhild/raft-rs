@@ -2,6 +2,36 @@ pub use crate::state::{Command, Query, QueryResponse};
 use crate::state::{KVCommand, KVQuery, KVQueryResponse};
 use bytes::Bytes;
 
+pub fn client(address: &str) -> ClientBuilder {
+    ClientBuilder::new(address)
+}
+
+pub struct ClientBuilder {
+    address: String,
+    max_retries: Option<usize>,
+}
+
+impl ClientBuilder {
+    pub fn new(address: &str) -> ClientBuilder {
+        ClientBuilder {
+            address: address.to_string(),
+            max_retries: None,
+        }
+    }
+
+    pub fn max_retries(&mut self, max_retries: usize) -> &mut Self {
+        self.max_retries = Some(max_retries);
+        self
+    }
+
+    #[cfg(feature = "http-rpc")]
+    pub fn build_http_client(&mut self) -> Client {
+        use crate::rpc::HttpClient;
+        let client = HttpClient::new(self.address.clone(), self.max_retries.unwrap_or(5));
+        Client::new(Box::new(client) as Box<dyn RaftClient>)
+    }
+}
+
 #[async_trait::async_trait]
 pub trait RaftClient {
     async fn apply(&mut self, cmd: Command) -> Result<(), ClientError>;
@@ -56,8 +86,11 @@ pub enum ClientError {
     RaftProtocolTerminated,
     MaxRetriesReached,
     IOError(std::io::Error),
+    #[cfg(feature = "http-rpc")]
     SerializationError(serde_json::Error),
+    #[cfg(feature = "http-rpc")]
     InvalidRequestError(hyper::http::Error),
+    #[cfg(feature = "http-rpc")]
     HttpError(hyper::Error),
 }
 
@@ -72,8 +105,11 @@ impl std::fmt::Display for ClientError {
                 write!(f, "The maximum number of retries has been reached")
             }
             ClientError::IOError(e) => write!(f, "{}", e),
+            #[cfg(feature = "http-rpc")]
             ClientError::SerializationError(e) => write!(f, "{}", e),
+            #[cfg(feature = "http-rpc")]
             ClientError::InvalidRequestError(e) => write!(f, "{}", e),
+            #[cfg(feature = "http-rpc")]
             ClientError::HttpError(e) => write!(f, "{}", e),
         }
     }
@@ -87,18 +123,21 @@ impl From<std::io::Error> for ClientError {
     }
 }
 
+#[cfg(feature = "http-rpc")]
 impl From<serde_json::Error> for ClientError {
     fn from(e: serde_json::Error) -> Self {
         ClientError::SerializationError(e)
     }
 }
 
+#[cfg(feature = "http-rpc")]
 impl From<hyper::http::Error> for ClientError {
     fn from(e: hyper::http::Error) -> Self {
         ClientError::InvalidRequestError(e)
     }
 }
 
+#[cfg(feature = "http-rpc")]
 impl From<hyper::Error> for ClientError {
     fn from(e: hyper::Error) -> Self {
         ClientError::HttpError(e)

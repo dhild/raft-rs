@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use log::{debug, error, info};
 use serde::{Deserialize, Serialize};
 use std::error::Error as StdError;
+use std::sync::Arc;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct AppendEntriesRequest {
@@ -362,4 +363,9 @@ mod http;
 
 #[cfg(feature = "http-rpc")]
 pub use http::{HttpClient, HttpClientConfig, HttpRPC};
-use std::sync::Arc;
+
+#[cfg(feature = "grpc-rpc")]
+mod grpc;
+
+#[cfg(feature = "grpc-rpc")]
+pub use grpc::{};

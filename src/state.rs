@@ -14,7 +14,6 @@ pub enum Query {
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub enum QueryResponse {
-    None,
     KV(KVQueryResponse),
 }
 
