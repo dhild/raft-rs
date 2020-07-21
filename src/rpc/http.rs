@@ -1,7 +1,7 @@
-use crate::client::{ClientError, RaftClient};
+use crate::protocol::RaftService;
 use crate::rpc::{
-    AppendEntriesRequest, AppendEntriesResponse, ClientApplyResponse, ClientQueryResponse,
-    RaftServer, RequestVoteRequest, RequestVoteResponse, RPC,
+    AppendEntriesRequest, AppendEntriesResponse, ClientApplyResponse, ClientError,
+    ClientQueryResponse, RaftClientRPC, RaftServerRPC, RequestVoteRequest, RequestVoteResponse,
 };
 use crate::state::{Command, Query, QueryResponse};
 use bytes::buf::BufExt;
@@ -21,7 +21,7 @@ pub struct HttpRPC {
 }
 
 impl HttpRPC {
-    pub fn spawn_server(address: &str, server: RaftServer) -> std::io::Result<HttpRPC> {
+    pub fn spawn_server(address: &str, server: RaftService) -> std::io::Result<HttpRPC> {
         start_server(address, Arc::new(server))?;
         Ok(HttpRPC {
             client: hyper::Client::new(),
@@ -30,7 +30,7 @@ impl HttpRPC {
 }
 
 #[async_trait::async_trait]
-impl RPC for HttpRPC {
+impl RaftServerRPC for HttpRPC {
     async fn append_entries(
         &self,
         peer_address: String,
@@ -48,7 +48,7 @@ impl RPC for HttpRPC {
     }
 }
 
-fn start_server<A: ToSocketAddrs>(addr: A, server: Arc<RaftServer>) -> Result<(), std::io::Error> {
+fn start_server<A: ToSocketAddrs>(addr: A, server: Arc<RaftService>) -> Result<(), std::io::Error> {
     let addrs = addr.to_socket_addrs()?;
     for addr in addrs {
         info!("Serving Raft at {}", &addr);
@@ -78,7 +78,7 @@ fn start_server<A: ToSocketAddrs>(addr: A, server: Arc<RaftServer>) -> Result<()
     Ok(())
 }
 
-async fn serve_request(server: Arc<RaftServer>, req: Request<Body>) -> Response<Body> {
+async fn serve_request(server: Arc<RaftService>, req: Request<Body>) -> Response<Body> {
     let response = match (req.method(), req.uri().path()) {
         (&Method::POST, "/v1/append_entries") => {
             parse_request_body(req)
@@ -199,7 +199,7 @@ impl HttpClient {
 }
 
 #[async_trait::async_trait]
-impl RaftClient for HttpClient {
+impl RaftClientRPC for HttpClient {
     async fn apply(&mut self, cmd: Command) -> Result<(), ClientError> {
         for _attempt in 0..self.max_retries {
             let response: Result<ClientApplyResponse, ClientError> =

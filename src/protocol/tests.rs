@@ -2,7 +2,8 @@ use crate::protocol::{
     Candidate, Follower, Forwarder, Leader, Peer, ProtocolState, RaftConfiguration,
 };
 use crate::rpc::{
-    AppendEntriesRequest, AppendEntriesResponse, RequestVoteRequest, RequestVoteResponse, RPC,
+    AppendEntriesRequest, AppendEntriesResponse, RaftServerRPC, RequestVoteRequest,
+    RequestVoteResponse,
 };
 use crate::storage::{LogCommand, MemoryStorage, Storage};
 use async_channel::{Receiver, Sender, TryRecvError};
@@ -218,7 +219,7 @@ impl TestRPC {
 }
 
 #[async_trait::async_trait]
-impl RPC for TestRPC {
+impl RaftServerRPC for TestRPC {
     async fn append_entries(
         &self,
         peer_address: String,

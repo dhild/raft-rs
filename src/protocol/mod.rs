@@ -1,6 +1,9 @@
-use crate::rpc::{AppendEntriesRequest, RequestVoteRequest, RPC};
-use crate::state::StateMachine;
-use crate::storage::{LogCommand, LogEntry, Storage};
+use crate::rpc::{
+    AppendEntriesRequest, AppendEntriesResponse, ClientApplyResponse, ClientQueryResponse, HttpRPC,
+    RaftServerRPC, RequestVoteRequest, RequestVoteResponse,
+};
+use crate::state::{Command, Query, StateMachine};
+use crate::storage::{LogCommand, LogEntry, MemoryStorage, Storage};
 use async_channel::{Receiver, RecvError, Sender, TryRecvError, TrySendError};
 use async_lock::Lock;
 use log::{debug, error, info, trace};
@@ -159,7 +162,7 @@ pub struct ProtocolTasks {
     configuration: Lock<RaftConfiguration>,
     timeout: Duration,
     storage: Lock<Box<dyn Storage>>,
-    rpc: Arc<dyn RPC>,
+    rpc: Arc<dyn RaftServerRPC>,
     commit_index: Lock<usize>,
     current_state: Lock<ProtocolState>,
     term_updates_tx: Sender<()>,
@@ -176,7 +179,7 @@ impl ProtocolTasks {
         timeout: Duration,
         storage: Lock<Box<dyn Storage>>,
         current_state: Lock<ProtocolState>,
-        rpc: Arc<dyn RPC>,
+        rpc: Arc<dyn RaftServerRPC>,
         term_updates_tx: Sender<()>,
         term_updates_rx: Receiver<()>,
         commits_to_apply_tx: Sender<(usize, LogCommand)>,
@@ -352,7 +355,7 @@ pub struct Candidate {
     configuration: Lock<RaftConfiguration>,
     timeout: Duration,
     storage: Lock<Box<dyn Storage>>,
-    rpc: Arc<dyn RPC>,
+    rpc: Arc<dyn RaftServerRPC>,
     term_updates_rx: Receiver<()>,
 }
 
@@ -362,7 +365,7 @@ impl Candidate {
         configuration: Lock<RaftConfiguration>,
         timeout: Duration,
         storage: Lock<Box<dyn Storage>>,
-        rpc: Arc<dyn RPC>,
+        rpc: Arc<dyn RaftServerRPC>,
         term_updates_rx: Receiver<()>,
     ) -> Candidate {
         let timeout = timeout.mul_f32(1. + 2. * rand::thread_rng().gen::<f32>());
@@ -550,7 +553,7 @@ impl Leader {
         configuration: Lock<RaftConfiguration>,
         timeout: Duration,
         storage: Lock<Box<dyn Storage>>,
-        rpc: Arc<dyn RPC>,
+        rpc: Arc<dyn RaftServerRPC>,
         commit_index: Lock<usize>,
         term_updates_tx: Sender<()>,
         term_updates_rx: Receiver<()>,
@@ -744,7 +747,7 @@ pub struct Forwarder {
     commit_index: Lock<usize>,
     new_logs_rx: Receiver<usize>,
     term_updates_tx: Sender<()>,
-    rpc: Arc<dyn RPC>,
+    rpc: Arc<dyn RaftServerRPC>,
 }
 
 impl Forwarder {
@@ -757,7 +760,7 @@ impl Forwarder {
         commit_index: Lock<usize>,
         new_logs_rx: Receiver<usize>,
         term_updates_tx: Sender<()>,
-        rpc: Arc<dyn RPC>,
+        rpc: Arc<dyn RaftServerRPC>,
         next_index: usize,
     ) -> Forwarder {
         // Raft is able to elect and maintain a steady leader as long as the system satisfies the
@@ -903,5 +906,346 @@ impl Forwarder {
             prev_log_term,
             entries,
         })
+    }
+}
+
+#[derive(Debug)]
+pub enum RaftServiceError {
+    RaftProtocolTerminated,
+    StorageError(std::io::Error),
+}
+
+impl std::fmt::Display for RaftServiceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RaftServiceError::RaftProtocolTerminated => {
+                write!(f, "The raft protocol has been terminated")
+            }
+            RaftServiceError::StorageError(e) => {
+                write!(f, "Error while interacting with stable storage: {}", e)
+            }
+        }
+    }
+}
+
+impl From<std::io::Error> for RaftServiceError {
+    fn from(e: std::io::Error) -> Self {
+        RaftServiceError::StorageError(e)
+    }
+}
+
+impl std::error::Error for RaftServiceError {}
+
+#[derive(Clone)]
+pub struct RaftService {
+    configuration: Lock<RaftConfiguration>,
+    storage: Lock<Box<dyn Storage>>,
+    term_updates: Sender<()>,
+    append_entries_tx: Sender<usize>,
+    current_state: Lock<ProtocolState>,
+    new_logs_tx: Sender<usize>,
+    last_applied_tx: Lock<Vec<Sender<usize>>>,
+    state_machine: Lock<StateMachine>,
+}
+
+impl RaftService {
+    pub async fn append_entries(
+        &self,
+        req: AppendEntriesRequest,
+    ) -> std::io::Result<AppendEntriesResponse> {
+        let mut storage = self.storage.lock().await;
+
+        let current_term = storage.current_term()?;
+        // Ensure we are on the latest term
+        if req.term > current_term {
+            storage.set_current_term(req.term)?;
+            storage.set_voted_for(None)?;
+            if self.term_updates.send(()).await.is_err() {
+                error!("Raft protocol has been shut down");
+            }
+            return Ok(AppendEntriesResponse::failed(current_term));
+        }
+        // Ensure the leader is on the latest term
+        if req.term < current_term {
+            return Ok(AppendEntriesResponse::failed(current_term));
+        }
+        // Update the current leader:
+        {
+            let mut configuration = self.configuration.lock().await;
+            if !configuration.is_current_leader(&req.leader_id) {
+                info!(
+                    "Updating local leader to point to the current leader {}",
+                    req.leader_id
+                );
+
+                configuration.set_current_leader(&req.leader_id);
+            }
+        }
+
+        // Ensure our previous entries match
+        if let Some(term) = storage.get_term(req.prev_log_index)? {
+            if term != req.prev_log_term {
+                return Ok(AppendEntriesResponse::failed(current_term));
+            }
+        }
+        // Remove any conflicting log entries
+        for e in req.entries.iter() {
+            match storage.get_term(e.index)? {
+                None => break,
+                Some(x) if x != e.term => {}
+                _ => {
+                    storage.remove_entries_starting_at(e.index)?;
+                    break;
+                }
+            }
+        }
+        // Append any new entries
+        let mut index = storage.last_index()?;
+        for e in req.entries {
+            if e.index > index {
+                storage.append_entry(e.term, e.command)?;
+                index = e.index;
+            }
+        }
+        drop(storage);
+
+        // Update the commit index with the latest committed value in our logs
+        if self
+            .append_entries_tx
+            .send(req.leader_commit.min(index))
+            .await
+            .is_err()
+        {
+            error!("Raft protocol has been shut down");
+            return Ok(AppendEntriesResponse::failed(current_term));
+        }
+
+        Ok(AppendEntriesResponse::success(current_term))
+    }
+
+    pub async fn request_vote(
+        &self,
+        req: RequestVoteRequest,
+    ) -> std::io::Result<RequestVoteResponse> {
+        let mut storage = self.storage.lock().await;
+
+        // Ensure we are on the latest term - if we are not, update and continue processing the request.
+        let current_term = {
+            let current_term = storage.current_term()?;
+            if req.term > current_term {
+                storage.set_current_term(req.term)?;
+                if self.term_updates.send(()).await.is_err() {
+                    error!("Raft protocol has been shut down");
+                    return Ok(RequestVoteResponse::failed(current_term));
+                }
+                req.term
+            } else {
+                current_term
+            }
+        };
+        // Ensure the candidate is on the latest term
+        if req.term < current_term {
+            return Ok(RequestVoteResponse::failed(current_term));
+        }
+        // Make sure we didn't vote for a different candidate already
+        if storage
+            .voted_for()?
+            .map(|c| c == req.candidate_id)
+            .unwrap_or(true)
+        {
+            // Grant the vote as long as their log is up to date.
+            // Raft determines which of two logs is more up-to-date by comparing the index
+            // and term of the last entries in the logs. If the logs have last entries with
+            // different terms, then the log with the later term is more up-to-date. If the
+            // logs end with the same term, then whichever log is longer is more up-to-date.
+            let term = storage.last_term()?;
+            let index = storage.last_index()?;
+            if term <= req.last_log_term && index <= req.last_log_index {
+                debug!("Voting for {} in term {}", &req.candidate_id, req.term);
+                storage.set_voted_for(Some(req.candidate_id))?;
+                return Ok(RequestVoteResponse::success(current_term));
+            }
+        }
+        Ok(RequestVoteResponse::failed(current_term))
+    }
+
+    pub async fn apply(&self, cmd: Command) -> Result<ClientApplyResponse, RaftServiceError> {
+        {
+            match *self.current_state.lock().await {
+                ProtocolState::Leader => (),
+                ProtocolState::Shutdown => return Err(RaftServiceError::RaftProtocolTerminated),
+                ProtocolState::Candidate | ProtocolState::Follower => {
+                    let leader_address = self.configuration.lock().await.current_leader_address();
+                    debug!("Not leader, responding to apply with {:?}", leader_address);
+                    return Ok(ClientApplyResponse {
+                        leader_address,
+                        success: false,
+                    });
+                }
+            }
+        }
+        let command = LogCommand::Command(cmd);
+
+        let index = {
+            let mut storage = self.storage.lock().await;
+
+            let term = storage.current_term()?;
+
+            storage.append_entry(term, command)?
+        };
+
+        let (tx, rx) = async_channel::bounded(1);
+        {
+            let mut vec = self.last_applied_tx.lock().await;
+            vec.push(tx);
+        }
+
+        self.new_logs_tx
+            .send(index)
+            .await
+            .map_err(|_| RaftServiceError::RaftProtocolTerminated)?;
+
+        while let Ok(last_applied) = rx.recv().await {
+            if last_applied >= index {
+                let leader_address = self.configuration.lock().await.current_leader_address();
+                return Ok(ClientApplyResponse {
+                    leader_address,
+                    success: true,
+                });
+            }
+        }
+        Err(RaftServiceError::RaftProtocolTerminated)
+    }
+
+    pub async fn query(&self, query: Query) -> Result<ClientQueryResponse, RaftServiceError> {
+        {
+            match *self.current_state.lock().await {
+                ProtocolState::Leader => (),
+                ProtocolState::Shutdown => return Err(RaftServiceError::RaftProtocolTerminated),
+                ProtocolState::Candidate | ProtocolState::Follower => {
+                    let leader_address = self.configuration.lock().await.current_leader_address();
+                    return Ok(ClientQueryResponse {
+                        leader_address,
+                        response: None,
+                    });
+                }
+            }
+        }
+        // TODO: Send heartbeat, wait for majority to respond
+        // After majority responds, query state machine
+
+        let leader_address = { self.configuration.lock().await.current_leader_address() };
+        let state_machine = self.state_machine.lock().await;
+        let response = state_machine.query(query);
+        Ok(ClientQueryResponse {
+            leader_address,
+            response: Some(response),
+        })
+    }
+}
+
+pub struct ServerConfig {
+    id: String,
+    address: String,
+    peers: Vec<Peer>,
+    timeout: Option<Duration>,
+    storage: Option<Lock<Box<dyn Storage>>>,
+}
+
+impl ServerConfig {
+    pub fn new(id: &str, address: &str) -> ServerConfig {
+        ServerConfig {
+            id: id.to_string(),
+            address: address.to_string(),
+            peers: Vec::new(),
+            timeout: None,
+            storage: None,
+        }
+    }
+
+    pub fn peer(&mut self, id: &str, address: &str) -> &mut Self {
+        self.peers.push(Peer {
+            id: id.to_string(),
+            address: address.to_string(),
+            voting: true,
+        });
+        self
+    }
+
+    pub fn timeout(&mut self, timeout: Duration) -> &mut Self {
+        self.timeout = Some(timeout);
+        self
+    }
+
+    pub fn in_memory_storage(&mut self) -> &mut Self {
+        self.storage = Some(Lock::new(Box::new(MemoryStorage::new())));
+        self
+    }
+
+    #[cfg(feature = "http-rpc")]
+    pub fn spawn_http(&mut self) -> Result<(), std::io::Error> {
+        let address = self.address.clone();
+        self.spawn_protocol(|server| HttpRPC::spawn_server(&address, server))
+    }
+
+    fn spawn_protocol<R: RaftServerRPC + 'static, F: FnOnce(RaftService) -> std::io::Result<R>>(
+        &mut self,
+        rpc: F,
+    ) -> std::io::Result<()> {
+        let id = self.id.clone();
+        let storage = self.storage.clone().expect("no storage device configured");
+        self.storage = None;
+        let timeout = self.timeout.unwrap_or_else(|| Duration::from_millis(150));
+        let configuration = Lock::new(RaftConfiguration::new(
+            id.clone(),
+            self.address.clone(),
+            self.peers.clone(),
+        ));
+        let state_machine = Lock::new(StateMachine::default());
+        let current_state = Lock::new(ProtocolState::Follower);
+        let last_applied_tx = Lock::new(Vec::new());
+        let (commits_to_apply_tx, commits_to_apply_rx) = async_channel::bounded(1);
+        let (append_entries_tx, append_entries_rx) = async_channel::bounded(1);
+        let (term_updates_tx, term_updates_rx) = async_channel::bounded(1);
+        let (new_logs_tx, new_logs_rx) = async_channel::bounded(1);
+
+        let raft_server = RaftService {
+            configuration: configuration.clone(),
+            storage: storage.clone(),
+            term_updates: term_updates_tx.clone(),
+            append_entries_tx,
+            current_state: current_state.clone(),
+            new_logs_tx,
+            last_applied_tx: last_applied_tx.clone(),
+            state_machine: state_machine.clone(),
+        };
+
+        let rpc = Arc::new(rpc(raft_server)?) as Arc<dyn RaftServerRPC>;
+
+        tokio::spawn(async move {
+            debug!("Starting log committer task");
+            let mut lc = LogCommitter::new(state_machine, commits_to_apply_rx, last_applied_tx);
+            lc.run().await;
+            debug!("Closing log committer task");
+        });
+        tokio::spawn(async move {
+            let mut tasks = ProtocolTasks::new(
+                id,
+                configuration,
+                timeout,
+                storage,
+                current_state,
+                rpc,
+                term_updates_tx,
+                term_updates_rx,
+                commits_to_apply_tx,
+                append_entries_rx,
+                new_logs_rx,
+            );
+            debug!("Starting raft protocol task");
+            tasks.run().await;
+            debug!("Closing raft protocol task");
+        });
+        Ok(())
     }
 }
